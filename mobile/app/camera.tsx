@@ -21,7 +21,7 @@ import {
 } from "expo-camera";
 
 import { router } from "expo-router";
-import { File } from "expo-file-system";
+import { File, Paths, Directory } from "expo-file-system";
 
 import { detectImage } from "src/services/api";
 import {
@@ -42,6 +42,7 @@ import DetectionOverlay from "src/components/DetectionOverlay";
 
 import type {
   DetectionObject,
+  FreePath,
   NavigationResult,
   SmartVisionResponse,
   ConnectionState,
@@ -171,15 +172,43 @@ function getObjects(
     return [];
   }
 
+  const list: DetectionObject[] = [];
+
   if (Array.isArray(response.objects)) {
-    return response.objects;
+    list.push(...response.objects);
+  } else if (Array.isArray(response.detections)) {
+    list.push(...response.detections);
   }
 
-  if (Array.isArray(response.detections)) {
-    return response.detections;
+  if (Array.isArray(response.unknown_objects)) {
+    for (const u of response.unknown_objects) {
+      list.push({
+        ...u,
+        class_name: "Unknown Obstacle",
+      });
+    }
   }
 
-  return [];
+  // Priority ranking: Humans > Vehicles > Hazards > Unknown Obstacles > Furniture > Other objects
+  const getPriorityWeight = (obj: DetectionObject): number => {
+    const name = (obj.class_name || "").toLowerCase();
+    let base = 0.5;
+    if (name.includes("person") || name.includes("human")) base = 1.0;
+    else if (name.includes("car") || name.includes("vehicle") || name.includes("bike")) base = 0.95;
+    else if (name.includes("stair") || name.includes("drop")) base = 0.90;
+    else if (name.includes("door")) base = 0.70;
+    else if (name.includes("chair") || name.includes("table")) base = 0.60;
+    else if (name.includes("unknown")) base = 0.45;
+
+    const risk = typeof obj.risk_score === "number" ? obj.risk_score : 0;
+    const dist = typeof obj.distance_m === "number" && obj.distance_m > 0 ? obj.distance_m : 5.0;
+    const proximityBonus = Math.max(0, 1.0 - dist / 5.0);
+
+    return base * 0.4 + risk * 0.4 + proximityBonus * 0.2;
+  };
+
+  list.sort((a, b) => getPriorityWeight(b) - getPriorityWeight(a));
+  return list;
 }
 
 
@@ -340,9 +369,11 @@ function getDirectionText(
 
 
 let lastHapticState = "";
+let lastHapticTime = 0;
 
 function handleDetectionHaptics(response: SmartVisionResponse): void {
   const nav = getNavigation(response);
+  const now = Date.now();
   const isEmergency =
     response.emergency_stop === true ||
     (response.safety_level || "").toUpperCase() === "EMERGENCY" ||
@@ -356,25 +387,81 @@ function handleDetectionHaptics(response: SmartVisionResponse): void {
   if (isEmergency) {
     if (lastHapticState !== "EMERGENCY") {
       lastHapticState = "EMERGENCY";
+      lastHapticTime = now;
       triggerHaptic("EMERGENCY");
     }
   } else if (isRapid) {
     if (lastHapticState !== "DANGER") {
       lastHapticState = "DANGER";
+      lastHapticTime = now;
       triggerHaptic("DANGER");
     }
   } else if (nav === "TURN_LEFT") {
     if (lastHapticState !== "TURN_LEFT") {
       lastHapticState = "TURN_LEFT";
+      lastHapticTime = now;
       triggerHaptic("TURN_LEFT");
     }
   } else if (nav === "TURN_RIGHT") {
     if (lastHapticState !== "TURN_RIGHT") {
       lastHapticState = "TURN_RIGHT";
+      lastHapticTime = now;
       triggerHaptic("TURN_RIGHT");
+    }
+  } else if (nav === "MOVE_LEFT") {
+    if (lastHapticState !== "MOVE_LEFT") {
+      lastHapticState = "MOVE_LEFT";
+      lastHapticTime = now;
+      triggerHaptic("MOVE_LEFT");
+    }
+  } else if (nav === "MOVE_RIGHT") {
+    if (lastHapticState !== "MOVE_RIGHT") {
+      lastHapticState = "MOVE_RIGHT";
+      lastHapticTime = now;
+      triggerHaptic("MOVE_RIGHT");
+    }
+  } else if (nav === "SLOW_DOWN") {
+    if (lastHapticState !== "SLOW_DOWN") {
+      lastHapticState = "SLOW_DOWN";
+      lastHapticTime = now;
+      triggerHaptic("SLOW_DOWN");
+    }
+  } else if (nav === "GO_FORWARD" || nav === "FORWARD") {
+    if (lastHapticState !== "FORWARD") {
+      lastHapticState = "FORWARD";
+      lastHapticTime = now;
+      triggerHaptic("PATH_CLEAR");
     }
   } else {
     lastHapticState = nav;
+  }
+}
+
+function pruneTemporaryCameraCache(): void {
+  try {
+    const cacheDir = Paths.cache;
+    if (cacheDir && cacheDir.exists) {
+      const items = cacheDir.list();
+      for (const item of items) {
+        if (item instanceof File) {
+          const name = item.name.toLowerCase();
+          if (
+            name.endsWith(".jpg") ||
+            name.endsWith(".jpeg") ||
+            name.includes("smartvision") ||
+            name.includes("camera")
+          ) {
+            try {
+              item.delete();
+            } catch {
+              // Non-fatal
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // Fail silently
   }
 }
 
@@ -397,6 +484,11 @@ export default function CameraScreen() {
   const frameCountRef = useRef(0);
   const latestResponseRef = useRef<SmartVisionResponse | null>(null);
 
+  const lastNavTextRef = useRef("Move Forward");
+  const lastVoiceMsgRef = useRef("");
+  const lastSafetyLevelRef = useRef("SAFE");
+  const lastEmergencyRef = useRef(false);
+
   const [processing, setProcessing] = useState(false);
   const [backendError, setBackendError] = useState("");
 
@@ -406,6 +498,14 @@ export default function CameraScreen() {
   const [safetyLevel, setSafetyLevel] = useState("SAFE");
   const [isEmergency, setIsEmergency] = useState(false);
   const [detectedObjects, setDetectedObjects] = useState<DetectionObject[]>([]);
+  const [frameDimensions, setFrameDimensions] = useState<{ width: number; height: number }>({ width: 640, height: 480 });
+  const [primaryObstacleText, setPrimaryObstacleText] = useState("Clear");
+  const [distanceText, setDistanceText] = useState("Path Clear");
+  const [corridorClearance, setCorridorClearance] = useState({
+    left: true,
+    center: true,
+    right: true,
+  });
 
   // Phase 13 State Management
   const [connectionState, setConnectionState] =
@@ -444,8 +544,10 @@ export default function CameraScreen() {
       connectionWatchdog.stop();
       processingRef.current = false;
       lastHapticState = "";
+      lastHapticTime = 0;
       void stopSpeech();
       voiceManager.reset();
+      pruneTemporaryCameraCache();
     };
   }, []);
 
@@ -491,6 +593,7 @@ export default function CameraScreen() {
         await cameraRef.current.takePictureAsync({
           quality: IMAGE_QUALITY,
           skipProcessing: true,
+          shutterSound: false,
         });
 
       const tCapture = Date.now() - tStart;
@@ -545,12 +648,71 @@ export default function CameraScreen() {
         const assistive = generateAssistiveInstruction(result).text;
         const msg = result.voice_instruction || assistive || "";
 
+        // Extract primary obstacle and distance
+        let obsText = "Clear";
+        let distText = "Path Clear";
+
+        if (result.primary_obstacle) {
+          const po = result.primary_obstacle;
+          let name = po.class_name || (po as { name?: string }).name || (po as { label?: string }).label || "Obstacle";
+          if (name.toLowerCase().includes("unknown")) {
+            name = "Unknown Obstacle";
+          } else {
+            name = name.replace(/_/g, " ").replace(/\b\w/g, (l) => l.toUpperCase());
+          }
+          const pos = po.position ? ` (${po.position})` : "";
+          obsText = `${name}${pos}`;
+          if (typeof po.distance_m === "number" && Number.isFinite(po.distance_m)) {
+            distText = `${po.distance_m.toFixed(1)} m`;
+          } else if (po.distance_category) {
+            distText = po.distance_category.replace("_", " ");
+          }
+        } else if (result.objects && result.objects.length > 0) {
+          const po = result.objects[0];
+          let name = po.class_name || (po as { name?: string }).name || "Obstacle";
+          if (name.toLowerCase().includes("unknown")) {
+            name = "Unknown Obstacle";
+          } else {
+            name = name.replace(/_/g, " ").replace(/\b\w/g, (l) => l.toUpperCase());
+          }
+          const pos = po.position ? ` (${po.position})` : "";
+          obsText = `${name}${pos}`;
+          if (typeof po.distance_m === "number" && Number.isFinite(po.distance_m)) {
+            distText = `${po.distance_m.toFixed(1)} m`;
+          }
+        }
+
+        // Extract corridor clearance from free_path
+        let leftClear = true;
+        let centerClear = true;
+        let rightClear = true;
+        if (result.free_path && typeof result.free_path === "object") {
+          const fp = result.free_path as FreePath;
+          if (typeof fp.left_clear === "boolean") leftClear = fp.left_clear;
+          if (typeof fp.center_clear === "boolean") centerClear = fp.center_clear;
+          if (typeof fp.right_clear === "boolean") rightClear = fp.right_clear;
+        }
+
+        setPrimaryObstacleText(obsText);
+        setDistanceText(distText);
+        setCorridorClearance({ left: leftClear, center: centerClear, right: rightClear });
+
         // Update lightweight display states
         setNavigationText(navText);
         setVoiceMessage(msg);
         setSafetyLevel(currentSafety);
         setIsEmergency(emergencyStop);
+        lastNavTextRef.current = navText;
+        lastVoiceMsgRef.current = msg;
+        lastSafetyLevelRef.current = currentSafety;
+        lastEmergencyRef.current = emergencyStop;
         setDetectedObjects(getObjects(result));
+        if (result.frame?.width && result.frame?.height) {
+          setFrameDimensions({
+            width: result.frame.width,
+            height: result.frame.height,
+          });
+        }
         setBackendError("");
 
         const tTtsStart = Date.now();
@@ -583,14 +745,24 @@ export default function CameraScreen() {
       setBackendError(message);
       setDetectedObjects([]);
     } finally {
+      // Safely delete the temporary camera JPEG frame immediately
       if (capturedUri) {
         try {
           const tempFile = new File(capturedUri);
           tempFile.delete();
+          if (tempFile.exists) {
+            tempFile.delete();
+          }
         } catch {
           // Ignore if file was already removed
         }
       }
+
+      // Periodic sanitation every 20 frames to purge any orphaned camera temp files
+      if (frameCountRef.current > 0 && frameCountRef.current % 20 === 0) {
+        pruneTemporaryCameraCache();
+      }
+
       processingRef.current = false;
       if (mountedRef.current) {
         setProcessing(false);
@@ -719,13 +891,17 @@ export default function CameraScreen() {
         facing="back"
         mode="picture"
         pictureSize="640x480"
+        mute={true}
+        accessible={false}
+        importantForAccessibility="no-hide-descendants"
+        accessibilityElementsHidden={true}
       />
 
       {/* 1.1 REAL-TIME OBJECT BOUNDING BOXES */}
       <DetectionOverlay
         detections={detectedObjects}
-        frameWidth={latestResponseRef.current?.frame?.width ?? 640}
-        frameHeight={latestResponseRef.current?.frame?.height ?? 480}
+        frameWidth={frameDimensions.width}
+        frameHeight={frameDimensions.height}
       />
 
       {/* 2. TOP ACCESSIBLE CONTROLS */}
@@ -825,9 +1001,9 @@ export default function CameraScreen() {
               ? styles.guidanceAware
               : styles.guidanceSafe,
           ]}
-          accessible={true}
-          accessibilityLiveRegion="assertive"
-          accessibilityLabel={`Guidance: ${effectiveNavText}. ${effectiveVoiceText}`}
+          accessible={false}
+          accessibilityElementsHidden={true}
+          importantForAccessibility="no-hide-descendants"
         >
           <View style={styles.guidanceHeader}>
             <Text style={styles.guidanceTitle}>LIVE GUIDANCE</Text>
@@ -860,6 +1036,32 @@ export default function CameraScreen() {
           >
             {effectiveNavText}
           </Text>
+
+          {/* Key Metrics Row: Distance & Primary Obstacle */}
+          <View style={styles.metricsRow}>
+            <View style={styles.metricItem}>
+              <Text style={styles.metricLabel}>DISTANCE</Text>
+              <Text style={styles.metricValue}>{distanceText}</Text>
+            </View>
+            <View style={styles.metricDivider} />
+            <View style={styles.metricItem}>
+              <Text style={styles.metricLabel}>OBSTACLE</Text>
+              <Text style={styles.metricValue} numberOfLines={1}>{primaryObstacleText}</Text>
+            </View>
+          </View>
+
+          {/* Corridor Clearance Chips */}
+          <View style={styles.corridorRow}>
+            <View style={[styles.corridorChip, corridorClearance.left ? styles.chipClear : styles.chipBlocked]}>
+              <Text style={styles.chipText}>L: {corridorClearance.left ? "CLEAR" : "BLOCKED"}</Text>
+            </View>
+            <View style={[styles.corridorChip, corridorClearance.center ? styles.chipClear : styles.chipBlocked]}>
+              <Text style={styles.chipText}>C: {corridorClearance.center ? "CLEAR" : "BLOCKED"}</Text>
+            </View>
+            <View style={[styles.corridorChip, corridorClearance.right ? styles.chipClear : styles.chipBlocked]}>
+              <Text style={styles.chipText}>R: {corridorClearance.right ? "CLEAR" : "BLOCKED"}</Text>
+            </View>
+          </View>
 
           {effectiveVoiceText.length > 0 && (
             <Text style={styles.voiceGuidanceText}>
@@ -1234,6 +1436,75 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginTop: 10,
     lineHeight: 22,
+  },
+
+  metricsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 10,
+    backgroundColor: "rgba(255, 255, 255, 0.07)",
+    borderRadius: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+
+  metricItem: {
+    flex: 1,
+  },
+
+  metricLabel: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: COLORS.secondaryText,
+    letterSpacing: 0.5,
+  },
+
+  metricValue: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: COLORS.white,
+    marginTop: 2,
+  },
+
+  metricDivider: {
+    width: 1,
+    height: 24,
+    backgroundColor: "rgba(255, 255, 255, 0.15)",
+    marginHorizontal: 10,
+  },
+
+  corridorRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 8,
+    marginTop: 8,
+  },
+
+  corridorChip: {
+    flex: 1,
+    paddingVertical: 5,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  chipClear: {
+    backgroundColor: "rgba(34, 197, 94, 0.22)",
+    borderWidth: 1,
+    borderColor: COLORS.safe,
+  },
+
+  chipBlocked: {
+    backgroundColor: "rgba(239, 68, 68, 0.22)",
+    borderWidth: 1,
+    borderColor: COLORS.danger,
+  },
+
+  chipText: {
+    fontSize: 11,
+    fontWeight: "900",
+    color: COLORS.white,
+    letterSpacing: 0.5,
   },
 
   bottomContent: {

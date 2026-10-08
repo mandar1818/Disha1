@@ -33,7 +33,7 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from backend.processors.frame_processor import FrameProcessor
 
@@ -124,10 +124,6 @@ def decode_image(
             "Invalid image data."
         )
 
-    image = cv2.imdecode(
-        array,
-        cv2.IMREAD_COLOR,
-    )
     try:
         image = cv2.imdecode(
             array,
@@ -165,21 +161,21 @@ def decode_image(
 def _decode_and_process(
     data: bytes,
     processor: FrameProcessor,
+    destination: Optional[Dict[str, Any]] = None,
+    timestamp: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Worker-thread helper: decodes image and processes frame without
-    blocking the main FastAPI asynchronous event loop.
     blocking the main FastAPI asynchronous event loop, ensuring prompt
     memory deallocation of intermediate buffers.
     """
-    image = decode_image(data)
-    return processor.process_frame(image)
     image = None
     try:
         image = decode_image(data)
-        return processor.process_frame(image)
+        return processor.process_frame(image, destination=destination, timestamp=timestamp)
     finally:
-        del image
+        if image is not None:
+            del image
 
 
 # ============================================================
@@ -237,6 +233,7 @@ def detection_status() -> Dict[str, Any]:
 )
 async def detect(
     file: UploadFile = File(...),
+    timestamp: Optional[float] = Form(None),
 ) -> Dict[str, Any]:
     """
     Process an uploaded camera frame.
@@ -358,6 +355,8 @@ async def detect(
             _decode_and_process,
             data,
             processor,
+            None,
+            timestamp,
         )
     except ValueError as exc:
         raise HTTPException(

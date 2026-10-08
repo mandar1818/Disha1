@@ -77,8 +77,11 @@ export interface VoiceManagerState {
   lastMotionTrend: string;
   lastDistanceCategory: string;
   lastThreatTrackId: string | number | null;
+  lastThreatClass?: string;
   lastAction: string;
   lastSteps: number | null;
+  lastOcrText: string;
+  lastOcrSpokenAt: number;
   queuedInstruction: QueuedInstruction | null;
 }
 
@@ -110,6 +113,7 @@ export const COOLDOWNS = {
   EMERGENCY: 1000,     // 1000ms re-trigger cooldown for emergency
   REPEAT: 7000,        // 7000ms repeat persistent condition
   CONNECTION: 5000,    // 5000ms between repeated connection lost notifications
+  OCR: 10000,          // 10000ms de-duplication window for identical OCR text
 };
 
 export const EMERGENCY_COOLDOWN_MS = 1000;
@@ -166,6 +170,52 @@ export function normalizeInstruction(text: string): string {
 export function formatStepWords(steps: number): string {
   const word = STEP_WORDS[steps] || String(steps);
   return steps === 1 ? `${word} step` : `${word} steps`;
+}
+
+/**
+ * Format raw class names into natural English object nouns for spoken announcements.
+ */
+export function formatObjectName(clsName: string): string {
+  const c = (clsName || "").toLowerCase().trim();
+  if (c.includes("unknown")) {
+    return "Unknown obstacle";
+  }
+  const map: Record<string, string> = {
+    person: "Person",
+    chair: "Chair",
+    diningtable: "Table",
+    table: "Table",
+    bottle: "Bottle",
+    cup: "Cup",
+    door: "Door",
+    stairs: "Stairs",
+    stair: "Stairs",
+    couch: "Couch",
+    sofa: "Sofa",
+    bed: "Bed",
+    laptop: "Laptop",
+    tv: "TV",
+    backpack: "Backpack",
+    cell_phone: "Phone",
+    cellphone: "Phone",
+    book: "Book",
+    car: "Car",
+    bicycle: "Bicycle",
+    motorcycle: "Motorcycle",
+    dog: "Dog",
+    cat: "Cat",
+  };
+  return map[c] || c.replace(/_/g, " ").replace(/\b\w/g, (l) => l.toUpperCase());
+}
+
+/**
+ * Format spatial positions into clear English location phrases.
+ */
+export function positionPhrase(pos: string): string {
+  const p = (pos || "CENTER").toUpperCase().trim();
+  if (p === "LEFT") return "on the left";
+  if (p === "RIGHT") return "on the right";
+  return "ahead";
 }
 
 /* =========================================================
@@ -240,9 +290,12 @@ export class VoiceDecisionManager {
     lastMotionTrend: "STATIONARY",
     lastDistanceCategory: "FAR",
     lastThreatTrackId: null,
+    lastThreatClass: "",
     lastAction: "NONE",
     lastSteps: null,
     queuedInstruction: null,
+    lastOcrText: "",
+    lastOcrSpokenAt: 0,
   };
 
   /**
@@ -262,8 +315,11 @@ export class VoiceDecisionManager {
       lastMotionTrend: "STATIONARY",
       lastDistanceCategory: "FAR",
       lastThreatTrackId: null,
+      lastThreatClass: "",
       lastAction: "NONE",
       lastSteps: null,
+      lastOcrText: "",
+      lastOcrSpokenAt: 0,
       queuedInstruction: null,
     };
   }
@@ -321,30 +377,28 @@ export class VoiceDecisionManager {
     const stepGuidance = response.step_guidance;
 
     let rawAction = "NONE";
-    if (stepGuidance && stepGuidance.action) {
-      rawAction = String(stepGuidance.action).toUpperCase();
-    } else if (typeof navRaw === "object" && navRaw?.action) {
+    if (typeof navRaw === "object" && navRaw?.action && String(navRaw.action).toUpperCase() !== "NONE") {
       rawAction = String(navRaw.action).toUpperCase();
+    } else if (stepGuidance && stepGuidance.action && String(stepGuidance.action).toUpperCase() !== "NONE") {
+      rawAction = String(stepGuidance.action).toUpperCase();
     } else if (typeof navRaw === "object" && navRaw?.direction) {
       rawAction = String(navRaw.direction).toUpperCase();
     } else if (typeof navRaw === "string" && navRaw) {
       rawAction = navRaw.toUpperCase();
     }
 
-    // Normalize action name
+    // Normalize action name (Requirement 8: MOVE = walking displacement, TURN = body orientation)
     let action = rawAction;
     if (["WALK_FORWARD", "GO_FORWARD", "FORWARD", "CONTINUE_FORWARD"].includes(rawAction)) {
       action = "MOVE_FORWARD";
     } else if (["WALK_BACK", "GO_BACK", "BACK"].includes(rawAction)) {
       action = "MOVE_BACK";
-    } else if (["MOVE_LEFT"].includes(rawAction)) {
     } else if (["MOVE_LEFT", "WALK_LEFT"].includes(rawAction)) {
       action = "MOVE_LEFT";
     } else if (["MOVE_RIGHT", "WALK_RIGHT"].includes(rawAction)) {
       action = "MOVE_RIGHT";
     } else if (["TURN_LEFT"].includes(rawAction)) {
       action = "TURN_LEFT";
-    } else if (["MOVE_RIGHT"].includes(rawAction)) {
     } else if (["TURN_RIGHT"].includes(rawAction)) {
       action = "TURN_RIGHT";
     }
@@ -432,16 +486,29 @@ export class VoiceDecisionManager {
     // Prefer backend's authoritative voice_instruction if present
     const backendVoice = response.voice_instruction?.trim();
 
-    // PRIORITY 5: EMERGENCY
+    // DIRECTIONAL DETOUR PRECEDENCE:
+    // If navigation commands a directional maneuver (MOVE_LEFT, MOVE_RIGHT, TURN_LEFT, TURN_RIGHT),
+    // ALWAYS prioritize guiding the user around the obstacle!
+    const isDirectionalDetour =
+      action === "TURN_LEFT" ||
+      action === "TURN_RIGHT" ||
+      action === "MOVE_LEFT" ||
+      action === "MOVE_RIGHT";
+
+    // PRIORITY 5: IMMINENT EMERGENCY STOP (only when no detour is possible)
     if (
-      emergencyStop ||
-      safetyAlert === "EMERGENCY_STOP" ||
-      (response.safety_level || "").toUpperCase() === "EMERGENCY" ||
-      action === "STOP" ||
-      (isRapidApproach && distanceM !== null && distanceM < 0.8)
+      !isDirectionalDetour &&
+      (emergencyStop ||
+        safetyAlert === "EMERGENCY_STOP" ||
+        (response.safety_level || "").toUpperCase() === "EMERGENCY" ||
+        (isRapidApproach && distanceM !== null && distanceM < 0.6))
     ) {
       priority = 5;
-      instruction = backendVoice || SAFETY_MESSAGES.EMERGENCY_STOP;
+      instruction =
+        backendVoice ||
+        (obstacle?.class_name
+          ? `Stop. ${formatObjectName(obstacle.class_name)} ${positionPhrase(obstacle.position || "CENTER")}.`
+          : SAFETY_MESSAGES.EMERGENCY_STOP);
     }
     // PRIORITY 5 (Safety Event): CONNECTION LOST
     else if (hasConnectionLost) {
@@ -453,39 +520,67 @@ export class VoiceDecisionManager {
       priority = 4;
       instruction = SAFETY_MESSAGES.CAMERA_OCCLUDED;
     }
-    // PRIORITY 4: RAPID DANGER / RAPIDLY APPROACHING
+    // PRIORITY 4: RAPID DANGER OR STOP ACTION WITHOUT LATERAL DETOUR
     else if (
-      isRapidApproach ||
-      safetyAlert === "WARNING_RAPID_APPROACH" ||
-      ((response.safety_level || "").toUpperCase() === "DANGER" && (isApproaching || action === "STOP"))
+      !isDirectionalDetour &&
+      (isRapidApproach ||
+        safetyAlert === "WARNING_RAPID_APPROACH" ||
+        action === "STOP" ||
+        ((response.safety_level || "").toUpperCase() === "DANGER" && isApproaching))
     ) {
       priority = 4;
       if (backendVoice) {
         instruction = backendVoice;
+      } else if (action === "STOP") {
+        instruction = obstacle?.class_name
+          ? `Stop. ${formatObjectName(obstacle.class_name)} ${positionPhrase(obstacle.position || "CENTER")}.`
+          : "Stop. Path is blocked.";
       } else if (isApproaching) {
         instruction = isPerson ? "Warning. Person approaching." : "Warning. Object approaching.";
       } else {
         instruction = "Stop.";
       }
     }
-    // PRIORITY 3: TURN / LATERAL MOVEMENT (strictly directional - NO steps appended)
-    else if (
-      action === "TURN_LEFT" ||
-      action === "TURN_RIGHT" ||
-      action === "MOVE_LEFT" ||
-      action === "MOVE_RIGHT"
-    ) {
+    // PRIORITY 3: TURN / LATERAL MOVEMENT (strictly directional)
+    else if (isDirectionalDetour) {
       priority = 3;
       if (backendVoice) {
-        instruction = backendVoice;
+        const lower = backendVoice.toLowerCase();
+        if (
+          lower.includes("turn") ||
+          lower.includes("move") ||
+          lower.includes("shift")
+        ) {
+          instruction = backendVoice;
+        } else if (action === "TURN_LEFT") {
+          instruction = `Turn left. ${backendVoice}`;
+        } else if (action === "TURN_RIGHT") {
+          instruction = `Turn right. ${backendVoice}`;
+        } else if (action === "MOVE_LEFT") {
+          instruction = `Move left. ${backendVoice}`;
+        } else {
+          instruction = `Move right. ${backendVoice}`;
+        }
       } else if (action === "TURN_LEFT") {
-        instruction = "Turn left.";
+        const pos = positionPhrase(obstacle?.position || "CENTER");
+        instruction = obstacle?.class_name
+          ? `${formatObjectName(obstacle.class_name)} ${pos}. Turn left.`
+          : "Turn left, then move forward.";
       } else if (action === "TURN_RIGHT") {
-        instruction = "Turn right.";
+        const pos = positionPhrase(obstacle?.position || "CENTER");
+        instruction = obstacle?.class_name
+          ? `${formatObjectName(obstacle.class_name)} ${pos}. Turn right.`
+          : "Turn right, then move forward.";
       } else if (action === "MOVE_LEFT") {
-        instruction = "Move left.";
+        const pos = positionPhrase(obstacle?.position || "RIGHT");
+        instruction = obstacle?.class_name
+          ? `Move left. ${formatObjectName(obstacle.class_name)} ${pos}.`
+          : (steps && steps > 0 ? `Move left for ${steps} steps.` : "Move left for 2 steps.");
       } else {
-        instruction = "Move right.";
+        const pos = positionPhrase(obstacle?.position || "LEFT");
+        instruction = obstacle?.class_name
+          ? `Move right. ${formatObjectName(obstacle.class_name)} ${pos}.`
+          : (steps && steps > 0 ? `Move right for ${steps} steps.` : "Move right for 3 steps.");
       }
     }
     // PRIORITY 2: MOVEMENT / SPEED GUIDANCE
@@ -495,17 +590,35 @@ export class VoiceDecisionManager {
       action === "SLOW_DOWN"
     ) {
       priority = 2;
-      if (backendVoice) {
-        instruction = backendVoice;
-      } else if (action === "SLOW_DOWN") {
-        instruction = "Slow down.";
-      } else {
-        const dirWord = action === "MOVE_FORWARD" ? "forward" : "back";
-        if (steps !== null && steps > 0) {
-          instruction = `Move ${dirWord} ${formatStepWords(steps)}.`;
+      const dirWord = action === "MOVE_FORWARD" ? "forward" : "back";
+      const moveClause =
+        steps !== null && steps > 0
+          ? `Move ${dirWord} ${formatStepWords(steps)}.`
+          : `Move ${dirWord}.`;
+
+      if (action === "SLOW_DOWN") {
+        const pos = positionPhrase(obstacle?.position || "CENTER");
+        instruction =
+          backendVoice ||
+          (obstacle?.class_name
+            ? `Slow down. ${formatObjectName(obstacle.class_name)} ${pos}.`
+            : "Slow down.");
+      } else if (backendVoice) {
+        const lower = backendVoice.toLowerCase();
+        if (
+          lower.includes("move") ||
+          lower.includes("walk") ||
+          lower.includes("go") ||
+          lower.includes("turn") ||
+          lower.includes("stop") ||
+          lower.includes("carefully")
+        ) {
+          instruction = backendVoice;
         } else {
-          instruction = `Move ${dirWord}.`;
+          instruction = `${backendVoice} ${moveClause}`;
         }
+      } else {
+        instruction = moveClause;
       }
     }
     // PRIORITY 1: GENERAL AWARENESS / NORMAL APPROACHING / CLEAR
@@ -519,11 +632,40 @@ export class VoiceDecisionManager {
         instruction = "Stop.";
       } else {
         // Clear scene or no action needed
-        const objectCount = response.objects?.length ?? 0;
-        if (objectCount === 0 && !obstacle && !threat) {
-          instruction = "Path clear.";
+        const targetObj = obstacle || (response.objects && response.objects.length > 0 ? response.objects[0] : null);
+        if (targetObj && targetObj.class_name) {
+          const name = formatObjectName(targetObj.class_name);
+          const pos = positionPhrase(targetObj.position || "CENTER");
+          instruction = `${name} ${pos}. Move forward.`;
+        } else if ((response.objects?.length ?? 0) === 0 && !obstacle && !threat) {
+          instruction = "Path clear. Move forward.";
         } else {
-          instruction = "Continue carefully.";
+          instruction = "Move forward.";
+        }
+      }
+
+      // OCR Signage Reading (Requirement 9: Non-spamming text guidance in safe conditions)
+      const ocr = response.ocr;
+      if (ocr && ocr.detected && ocr.primary_text && !threat && !obstacle) {
+        const ocrClean = ocr.primary_text.trim();
+        const normOcr = normalizeInstruction(ocrClean);
+        const normLastOcr = normalizeInstruction(this.state.lastOcrText);
+        const ocrElapsed = now - this.state.lastOcrSpokenAt;
+
+        if (ocrClean.length >= 2 && (normOcr !== normLastOcr || ocrElapsed >= COOLDOWNS.OCR)) {
+          if (
+            action === "NONE" ||
+            action === "MOVE_FORWARD" ||
+            !instruction ||
+            instruction === "Path clear." ||
+            instruction === "Continue carefully." ||
+            instruction === "Go forward."
+          ) {
+            priority = 1;
+            instruction = `Sign reads: ${ocrClean}`;
+            this.state.lastOcrText = ocrClean;
+            this.state.lastOcrSpokenAt = now;
+          }
         }
       }
     }
@@ -534,6 +676,16 @@ export class VoiceDecisionManager {
         instruction: "",
         priority: 1,
         reason: "Empty instruction generated",
+      };
+    }
+
+    if (response.should_speak === false) {
+      return {
+        action: "SUPPRESS",
+        instruction,
+        priority,
+        reason: "Backend indicated should_speak = false (stationary stop / unchanged situation)",
+        bypass_cooldown: false,
       };
     }
 
@@ -555,11 +707,18 @@ export class VoiceDecisionManager {
     const threatTrackChanged =
       threatTrackId !== null &&
       this.state.lastThreatTrackId !== null &&
-      threatTrackId !== this.state.lastThreatTrackId;
+      threatTrackId !== this.state.lastThreatTrackId &&
+      (action !== "STOP" || (distanceM !== null && distanceM < 0.40));
+
+    const threatClassChanged =
+      threatClass !== "" &&
+      Boolean(this.state.lastThreatClass) &&
+      threatClass !== this.state.lastThreatClass;
 
     const stepCountChanged =
       steps !== null &&
       this.state.lastSteps !== null &&
+      action !== "STOP" &&
       Math.abs(steps - this.state.lastSteps) >= 2;
 
     const bypassCooldown =
@@ -568,6 +727,7 @@ export class VoiceDecisionManager {
       motionEscalated ||
       distEscalated ||
       threatTrackChanged ||
+      threatClassChanged ||
       stepCountChanged;
 
     // Discard stale queued movement instructions on state change
@@ -584,6 +744,33 @@ export class VoiceDecisionManager {
     const isSameText = normCandidate === normLastSpoken && normCandidate.length > 0;
     const elapsed = now - this.state.lastSpokenAt;
 
+    const isStopInstruction =
+      action === "STOP" ||
+      normCandidate.startsWith("stop");
+
+    const wasAlreadyStopped =
+      this.state.lastAction === "STOP" ||
+      normLastSpoken.startsWith("stop");
+
+    // Suppress continuous STOP shouting if situation has not escalated
+    if (
+      isStopInstruction &&
+      wasAlreadyStopped &&
+      !safetyEscalated &&
+      !motionEscalated &&
+      (distanceM === null || distanceM >= 0.40)
+    ) {
+      if (elapsed < COOLDOWNS.REPEAT) {
+        return {
+          action: "SUPPRESS",
+          instruction,
+          priority,
+          reason: "User already stopped; continuous STOP suppressed",
+          bypass_cooldown: false,
+        };
+      }
+    }
+
     // Determine required cooldown window for candidate
     let requiredCooldown: number;
     if (priority === 5) {
@@ -595,6 +782,8 @@ export class VoiceDecisionManager {
       safetyAlert.toUpperCase().includes("DANGER")
     ) {
       requiredCooldown = COOLDOWNS.SAFETY; // 3000ms
+    } else if (action === "MOVE_FORWARD" && steps && steps > 1) {
+      requiredCooldown = Math.max(COOLDOWNS.NORMAL, steps * 750);
     } else {
       requiredCooldown = COOLDOWNS.NORMAL; // 2500ms
     }
@@ -726,6 +915,12 @@ export class VoiceDecisionManager {
     const now = Date.now();
     const decision = this.evaluate(response, now);
 
+    if (__DEV__) {
+      console.log(
+        `[VOICE_PIPELINE] decision=${decision.action} prio=${decision.priority} bypass=${decision.bypass_cooldown} spoken="${decision.instruction}" reason="${decision.reason}"`
+      );
+    }
+
     // Update state tracking fields for escalation detection
     const obstacle = response.primary_obstacle;
     const threat = response.predictive_threat;
@@ -764,14 +959,14 @@ export class VoiceDecisionManager {
         normAct = "MOVE_FORWARD";
       } else if (["WALK_BACK", "GO_BACK", "BACK"].includes(normAct)) {
         normAct = "MOVE_BACK";
-      } else if (["MOVE_LEFT"].includes(normAct)) {
-        normAct = "TURN_LEFT";
-      } else if (["MOVE_RIGHT"].includes(normAct)) {
-        normAct = "TURN_RIGHT";
       } else if (["MOVE_LEFT", "WALK_LEFT"].includes(normAct)) {
         normAct = "MOVE_LEFT";
       } else if (["MOVE_RIGHT", "WALK_RIGHT"].includes(normAct)) {
         normAct = "MOVE_RIGHT";
+      } else if (["TURN_LEFT"].includes(normAct)) {
+        normAct = "TURN_LEFT";
+      } else if (["TURN_RIGHT"].includes(normAct)) {
+        normAct = "TURN_RIGHT";
       }
 
       this.state.queuedInstruction = {
@@ -801,6 +996,9 @@ export class VoiceDecisionManager {
       const dist = (primaryThreat as any).distance_m ?? (primaryThreat as any).estimated_distance_m;
       this.state.lastDistanceCategory = (primaryThreat as any).distance_category || (typeof dist === "number" && dist < 0.8 ? "VERY_CLOSE" : "FAR");
       this.state.lastThreatTrackId = (primaryThreat as any).track_id || (primaryThreat as any).obstacle_id || null;
+      this.state.lastThreatClass = (primaryThreat.class_name || "").toLowerCase();
+    } else {
+      this.state.lastThreatClass = "";
     }
 
     const stepGuidance = response.step_guidance;
@@ -811,13 +1009,9 @@ export class VoiceDecisionManager {
       normAct = "MOVE_FORWARD";
     } else if (["WALK_BACK", "GO_BACK", "BACK"].includes(normAct)) {
       normAct = "MOVE_BACK";
-    } else if (["MOVE_LEFT"].includes(normAct)) {
-      normAct = "TURN_LEFT";
-    } else if (["MOVE_RIGHT"].includes(normAct)) {
-      normAct = "TURN_RIGHT";
-    } else if (["MOVE_LEFT", "WALK_LEFT"].includes(normAct)) {
+    } else if (["WALK_LEFT", "STEP_LEFT"].includes(normAct)) {
       normAct = "MOVE_LEFT";
-    } else if (["MOVE_RIGHT", "WALK_RIGHT"].includes(normAct)) {
+    } else if (["WALK_RIGHT", "STEP_RIGHT"].includes(normAct)) {
       normAct = "MOVE_RIGHT";
     }
     this.state.lastAction = normAct;

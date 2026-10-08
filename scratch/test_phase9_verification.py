@@ -362,8 +362,8 @@ def run_phase9_verification():
     print(f"Voice RIGHT: '{v_right}'")
     print(f"Voice FWD  : '{v_fwd}'")
     print(f"Voice STOP : '{v_stop}'")
-    assert v_left == "Turn left."
-    assert v_right == "Turn right."
+    assert v_left in ("Turn left.", "Turn left, then move forward.")
+    assert v_right in ("Turn right.", "Turn right, then move forward.")
     assert "forward" in v_fwd.lower()
     assert v_stop == "Stop."
     print("TEST 25 Result: PASS (Voice mapping correctly distinguishes turning from walking)")

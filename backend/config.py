@@ -55,7 +55,7 @@ MIDAS_ONNX_MODEL = MIDAS_ONNX_PATH
 # ------------------------------------------------------------
 # INFERENCE HYPERPARAMETERS
 # ------------------------------------------------------------
-DEFAULT_YOLO_CONFIDENCE = 0.50
+DEFAULT_YOLO_CONFIDENCE = 0.25
 DEFAULT_YOLO_IOU_THRESHOLD = 0.45
 DEFAULT_DEPTH_INPUT_SIZE = 256
 

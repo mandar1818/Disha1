@@ -71,7 +71,7 @@ export const IMAGE_QUALITY = 0.25;
 /**
  * Minimum YOLO confidence accepted by the mobile app.
  */
-export const MIN_CONFIDENCE = 0.5;
+export const MIN_CONFIDENCE = 0.25;
 
 /**
  * Authoritative live detection interval.

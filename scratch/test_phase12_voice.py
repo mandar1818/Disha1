@@ -284,6 +284,15 @@ class VoiceDecisionManagerPy:
                 "bypass_cooldown": False,
             }
 
+        if response.get("should_speak") is False:
+            return {
+                "action": "SUPPRESS",
+                "instruction": instruction,
+                "priority": priority,
+                "reason": "Backend indicated should_speak = False (stationary stop / unchanged situation)",
+                "bypass_cooldown": False,
+            }
+
         # 3. SIGNIFICANT STATE CHANGE DETECTION
         action_changed = (
             action != "NONE"
@@ -298,11 +307,13 @@ class VoiceDecisionManagerPy:
             threat_track_id is not None
             and self.last_threat_track_id is not None
             and threat_track_id != self.last_threat_track_id
+            and (action != "STOP" or (distance_m is not None and distance_m < 0.40))
         )
 
         step_count_changed = (
             steps is not None
             and self.last_steps is not None
+            and action != "STOP"
             and abs(steps - self.last_steps) >= 2
         )
 
@@ -320,6 +331,18 @@ class VoiceDecisionManagerPy:
         norm_last_spoken = normalize_instruction(self.last_spoken_text)
         is_same_text = norm_candidate == norm_last_spoken and len(norm_candidate) > 0
         elapsed = now - self.last_spoken_at
+
+        is_stop_instruction = action == "STOP" or norm_candidate.startswith("stop")
+        was_already_stopped = self.last_action == "STOP" or norm_last_spoken.startswith("stop")
+        if is_stop_instruction and was_already_stopped and not safety_escalated and not motion_escalated and (distance_m is None or distance_m >= 0.40):
+            if elapsed < COOLDOWNS["REPEAT"]:
+                return {
+                    "action": "SUPPRESS",
+                    "instruction": instruction,
+                    "priority": priority,
+                    "reason": "User already stopped; continuous STOP suppressed",
+                    "bypass_cooldown": False,
+                }
 
         # Determine required cooldown window for candidate
         if priority == 5:

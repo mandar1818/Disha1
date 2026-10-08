@@ -116,7 +116,7 @@ try:
         COCO_CLASSES_PATH,
     )
 except ImportError:
-    DEFAULT_YOLO_CONFIDENCE = 0.50
+    DEFAULT_YOLO_CONFIDENCE = 0.25
     DEFAULT_YOLO_IOU_THRESHOLD = 0.45
     YOLO_PYTORCH_PATH = "yolov8n.pt"
     YOLO_TFLITE_PATH = "edge_ai/models/yolov8n.tflite"
@@ -291,6 +291,9 @@ class YOLODetector:
             self.input_h = int(self.input_shape[2])
             self.input_w = int(self.input_shape[3])
 
+            # Pre-allocate reusable input buffer to eliminate per-frame allocations
+            self._input_buffer = np.zeros((1, 3, self.input_h, self.input_w), dtype=np.float32)
+
             self.is_loaded = True
             print(
                 f"[YOLO] TFLite model loaded: {self.model_path} "
@@ -442,17 +445,17 @@ class YOLODetector:
         padded = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8)
         padded[top : top + new_h, left : left + new_w] = resized
 
-        # BGR -> RGB, normalize to [0.0, 1.0], HWC -> CHW, contiguous batch tensor
+        # BGR -> RGB, normalize to [0.0, 1.0], HWC -> CHW into pre-allocated contiguous buffer
         padded_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        input_tensor = np.ascontiguousarray(
-            np.transpose(padded_rgb, (2, 0, 1))[np.newaxis, ...],
-            dtype=np.float32,
-        ) / 255.0
+        if not hasattr(self, "_input_buffer") or self._input_buffer is None:
+            self._input_buffer = np.zeros((1, 3, self.input_h, self.input_w), dtype=np.float32)
+        np.multiply(np.transpose(padded_rgb, (2, 0, 1)), 1.0 / 255.0, out=self._input_buffer[0], dtype=np.float32)
+        del padded, padded_rgb, resized
 
         # ----------------------------------------------------
         # Run TFLite interpreter
         # ----------------------------------------------------
-        self.interpreter.set_tensor(self.input_details[0]["index"], input_tensor)
+        self.interpreter.set_tensor(self.input_details[0]["index"], self._input_buffer)
         self.interpreter.invoke()
         output = self.interpreter.get_tensor(self.output_details[0]["index"])
 

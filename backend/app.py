@@ -32,6 +32,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.routes.detection import router as detection_router, warmup_processor
+from backend.routes.navigation import router as navigation_router
 
 
 # ============================================================
@@ -68,6 +69,9 @@ app.add_middleware(
 
 app.include_router(
     detection_router
+)
+app.include_router(
+    navigation_router
 )
 
 
@@ -196,6 +200,7 @@ async def startup_event():
     print("Documentation: http://127.0.0.1:8000/docs")
     print("Health:        http://127.0.0.1:8000/health")
     print("Detection:     POST /detect")
+    print("Navigation:    POST /navigation/start, POST /navigation/stop")
     print("=" * 60)
 
 

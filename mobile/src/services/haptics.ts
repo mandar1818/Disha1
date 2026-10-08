@@ -26,8 +26,11 @@ export type HapticEvent =
   | "EMERGENCY"
   | "CONNECTION_LOST"
   | "DANGER"
+  | "SLOW_DOWN"
   | "TURN_LEFT"
   | "TURN_RIGHT"
+  | "MOVE_LEFT"
+  | "MOVE_RIGHT"
   | "CAMERA_OCCLUDED"
   | "PATH_CLEAR";
 
@@ -40,8 +43,11 @@ export const HAPTIC_PATTERNS: Record<HapticEvent, readonly number[]> = {
   EMERGENCY: [0, 400, 150, 400, 150, 600],
   CONNECTION_LOST: [0, 250, 100, 250, 100, 250],
   DANGER: [0, 150, 100, 150],
+  SLOW_DOWN: [0, 120, 80, 120],
   TURN_LEFT: [0, 80, 80, 80],
   TURN_RIGHT: [0, 240],
+  MOVE_LEFT: [0, 60, 60, 60],
+  MOVE_RIGHT: [0, 160, 60, 160],
   CAMERA_OCCLUDED: [0, 60, 60, 60, 60, 60],
   PATH_CLEAR: [0, 50],
 } as const;
@@ -172,12 +178,24 @@ export function triggerDangerHaptic(): void {
   triggerHaptic("DANGER");
 }
 
+export function triggerSlowDownHaptic(): void {
+  triggerHaptic("SLOW_DOWN");
+}
+
 export function triggerTurnLeftHaptic(): void {
   triggerHaptic("TURN_LEFT");
 }
 
 export function triggerTurnRightHaptic(): void {
   triggerHaptic("TURN_RIGHT");
+}
+
+export function triggerMoveLeftHaptic(): void {
+  triggerHaptic("MOVE_LEFT");
+}
+
+export function triggerMoveRightHaptic(): void {
+  triggerHaptic("MOVE_RIGHT");
 }
 
 export function triggerCameraOccludedHaptic(): void {
@@ -203,8 +221,11 @@ const hapticsService = {
   triggerEmergencyHaptic,
   triggerConnectionLostHaptic,
   triggerDangerHaptic,
+  triggerSlowDownHaptic,
   triggerTurnLeftHaptic,
   triggerTurnRightHaptic,
+  triggerMoveLeftHaptic,
+  triggerMoveRightHaptic,
   triggerCameraOccludedHaptic,
   triggerPathClearHaptic,
 };

@@ -266,17 +266,16 @@ class MiDaSDepthEstimator:
     ) -> np.ndarray:
         target_height, target_width = image.shape[:2]
 
-        # Convert BGR -> RGB
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        # Resize to 256x256 and normalize with ImageNet stats
-        resized = cv2.resize(
-            rgb,
+        # Fast compact preprocessing: resize BGR to 256x256 first, then convert BGR -> RGB
+        resized_bgr = cv2.resize(
+            image,
             (self.input_size, self.input_size),
             interpolation=cv2.INTER_LINEAR,
-        ).astype(np.float32) / 255.0
+        )
+        rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) * (1.0 / 255.0)
 
-        normalized = (resized - self.IMAGENET_MEAN) / self.IMAGENET_STD
+        # Vectorized ImageNet standardization and CHW batch transpose
+        normalized = (rgb - self.IMAGENET_MEAN) / self.IMAGENET_STD
         input_tensor = np.ascontiguousarray(
             np.transpose(normalized, (2, 0, 1))[np.newaxis, ...],
             dtype=np.float32,
@@ -287,6 +286,7 @@ class MiDaSDepthEstimator:
             [self.output_name],
             {self.input_name: input_tensor},
         )[0]
+        del rgb, resized_bgr, normalized, input_tensor
 
         depth = np.squeeze(output)
 

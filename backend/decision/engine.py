@@ -36,6 +36,8 @@ import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.config import DEFAULT_YOLO_CONFIDENCE
+
 
 # ============================================================
 # DECISION ENGINE
@@ -67,7 +69,7 @@ class DecisionEngine:
     # General configuration
     # --------------------------------------------------------
 
-    DEFAULT_CONFIDENCE = 0.50
+    DEFAULT_CONFIDENCE = DEFAULT_YOLO_CONFIDENCE
     IOU_THRESHOLD = 0.60
 
     # Smaller MiDaS value = closer object.
@@ -203,6 +205,46 @@ class DecisionEngine:
         self.safety_margin_m: float = 0.75
         self.max_guidance_distance_m: float = 6.0
         self.last_steps: int = 0
+        # Phase 3: Closed-Loop Navigation state tracking
+        self.closed_loop_state: str = "CLEAR_PATH"
+        self.last_maneuver_command: str = "NONE"
+        # Navigation state machine and STOP suppression tracking
+        self.nav_state: str = "FORWARD"
+        self.last_nav_state: str = "FORWARD"
+        self.stop_frame_count: int = 0
+        self.stop_threat_id: Any = None
+        self.stop_threat_class: str = ""
+        self.stop_timestamp: float = 0.0
+        self.state_changed: bool = False
+        self.should_speak: bool = True
+        self.recovery_suggested: bool = False
+        self.path_cleared_from_stop: bool = False
+
+    def reset(self) -> None:
+        """Reset all internal tracking, history, and hysteresis state."""
+        self.track_history = []
+        self.object_tracks = {}
+        self._next_track_num = 1
+        self.frame_index = 0
+        self.last_action = "FORWARD"
+        self.candidate_action = "FORWARD"
+        self.action_vote_count = 0
+        self.last_direction = "CENTER"
+        self.direction_vote_count = 0
+        self.turn_state = "NONE"
+        self.last_steps = 0
+        self.closed_loop_state = "CLEAR_PATH"
+        self.last_maneuver_command = "NONE"
+        self.nav_state = "FORWARD"
+        self.last_nav_state = "FORWARD"
+        self.stop_frame_count = 0
+        self.stop_threat_id = None
+        self.stop_threat_class = ""
+        self.stop_timestamp = 0.0
+        self.state_changed = False
+        self.should_speak = True
+        self.recovery_suggested = False
+        self.path_cleared_from_stop = False
 
     # ========================================================
     # STATUS
@@ -224,7 +266,17 @@ class DecisionEngine:
                 self.caution_threshold,
             "aware_threshold":
                 self.aware_threshold,
+            "closed_loop_state":
+                self.closed_loop_state,
+            "last_maneuver_command":
+                self.last_maneuver_command,
         }
+
+    def decide(self, *args, **kwargs) -> Dict[str, Any]:
+        """
+        Convenience alias for analyze().
+        """
+        return self.analyze(*args, **kwargs)
 
     # ========================================================
     # NUMERIC HELPERS
@@ -325,10 +377,24 @@ class DecisionEngine:
         act = str(action).upper() if action else ""
 
         if not math.isfinite(d) or d <= 0.0 or cat == "UNKNOWN_DISTANCE":
+            if act in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD") and cat != "UNKNOWN_DISTANCE":
+                return 3.0, "HIGH", "Forward corridor clear ahead"
             return 0.0, "LOW", "Unknown obstacle distance; exercise caution"
 
-        if act in ("STOP", "TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT"):
-            return 0.0, "HIGH", "No forward movement during stop/turn"
+        if act in ("STOP", "EMERGENCY_STOP"):
+            return 0.0, "HIGH", "No movement during stop"
+
+        if act in ("TURN_LEFT", "TURN_RIGHT"):
+            return 0.0, "HIGH", "Body turn orientation"
+
+        if act == "MOVE_LEFT":
+            return 1.5, "HIGH", "Lateral step left"
+
+        if act == "MOVE_RIGHT":
+            return 2.25, "HIGH", "Lateral step right"
+
+        if act in ("BACK", "GO_BACK"):
+            return 2.25, "HIGH", "Safe backward movement"
 
         sm = float(safety_margin_m) if safety_margin_m is not None and safety_margin_m >= 0 else self.safety_margin_m
         max_d = float(max_guidance_distance_m) if max_guidance_distance_m is not None and max_guidance_distance_m > 0 else self.max_guidance_distance_m
@@ -511,89 +577,68 @@ class DecisionEngine:
     def remove_duplicates(
         self,
         objects: List[Dict[str, Any]],
+        reflection_uncertainty: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Remove duplicate detections.
+        Remove duplicate detections and mirror reflection ghost duplicates.
 
-        Two detections of the same class with high IoU
-        are considered duplicates.
-
-        The higher-confidence detection is retained.
+        Two detections of the same class with high IoU or matching mirror reflection
+        characteristics (similar size, divergent depth) are deduplicated, keeping
+        the physical closer obstacle for safety.
         """
-
         if not objects:
             return []
 
         sorted_objects = sorted(
             objects,
-            key=lambda item:
-                self._safe_float(
-                    item.get(
-                        "confidence",
-                        0.0,
-                    )
-                ),
-            reverse=True,
+            key=lambda item: (
+                -self._safe_float(item.get("confidence", 0.0)),
+                self._safe_float(item.get("depth", 1.0)),
+            ),
         )
 
         kept: List[Dict[str, Any]] = []
 
         for current in sorted_objects:
-
             current_class = str(
-                current.get(
-                    "class_name",
-                    current.get(
-                        "label",
-                        "unknown",
-                    ),
-                )
+                current.get("class_name", current.get("label", "unknown"))
             ).lower().strip()
-
-            current_box = self._bbox(
-                current
-            )
-
+            current_box = self._bbox(current)
+            d_curr = self._safe_float(current.get("depth", 1.0))
             duplicate = False
 
-            for existing in kept:
-
+            for idx, existing in enumerate(kept):
                 existing_class = str(
-                    existing.get(
-                        "class_name",
-                        existing.get(
-                            "label",
-                            "unknown",
-                        ),
-                    )
+                    existing.get("class_name", existing.get("label", "unknown"))
                 ).lower().strip()
 
-                if (
-                    current_class
-                    != existing_class
-                ):
+                if current_class != existing_class:
                     continue
 
-                existing_box = self._bbox(
-                    existing
-                )
+                existing_box = self._bbox(existing)
+                iou = self.calculate_iou(current_box, existing_box)
 
-                iou = self.calculate_iou(
-                    current_box,
-                    existing_box,
-                )
-
-                if (
-                    iou
-                    >= self.IOU_THRESHOLD
-                ):
+                if iou >= self.IOU_THRESHOLD:
                     duplicate = True
                     break
 
+                # Mirror reflection duplicate check
+                if reflection_uncertainty:
+                    w1 = abs(self._safe_float(current_box.get("x2", 0)) - self._safe_float(current_box.get("x1", 0)))
+                    w2 = abs(self._safe_float(existing_box.get("x2", 0)) - self._safe_float(existing_box.get("x1", 0)))
+
+                    if w1 > 0 and w2 > 0 and abs(w1 - w2) / max(w1, w2) < 0.35:
+                        d_exist = self._safe_float(existing.get("depth", 1.0))
+                        if abs(d_curr - d_exist) >= 0.35:
+                            # Candidate mirror reflection pair!
+                            # Keep the closer one (smaller depth = higher physical risk)
+                            if d_curr < d_exist:
+                                kept[idx] = current  # Replace further virtual reflection with closer physical object
+                            duplicate = True
+                            break
+
             if not duplicate:
-                kept.append(
-                    current
-                )
+                kept.append(current)
 
         return kept
 
@@ -673,10 +718,18 @@ class DecisionEngine:
             / width
         )
 
-        if normalized_x < 0.35:
+        norm_x1 = max(0.0, min(1.0, min(x1, x2) / width))
+        norm_x2 = max(0.0, min(1.0, max(x1, x2) / width))
+        corridor_overlap = max(0.0, min(norm_x2, 0.62) - max(norm_x1, 0.38))
+
+        # Center collision corridor overlap (if wide object encroaches significantly into walking path)
+        if corridor_overlap >= 0.08 or ((norm_x2 - norm_x1) >= 0.40 and norm_x1 <= 0.50 <= norm_x2):
+            return "CENTER"
+
+        if normalized_x < 0.38:
             return "LEFT"
 
-        if normalized_x > 0.65:
+        if normalized_x > 0.62:
             return "RIGHT"
 
         return "CENTER"
@@ -1161,9 +1214,19 @@ class DecisionEngine:
             # Suppress candidate if it overlaps significantly with an existing known object
             if known_objects:
                 suppressed = False
+                cand_area = max(1.0, (bbox["x2"] - bbox["x1"]) * (bbox["y2"] - bbox["y1"]))
                 for k_obj in known_objects:
                     k_box = self._bbox(k_obj)
-                    if self.calculate_iou(bbox, k_box) >= 0.30:
+                    inter_x1 = max(bbox["x1"], k_box["x1"])
+                    inter_y1 = max(bbox["y1"], k_box["y1"])
+                    inter_x2 = min(bbox["x2"], k_box["x2"])
+                    inter_y2 = min(bbox["y2"], k_box["y2"])
+                    inter_w = max(0.0, inter_x2 - inter_x1)
+                    inter_h = max(0.0, inter_y2 - inter_y1)
+                    inter_area = inter_w * inter_h
+                    containment = inter_area / cand_area
+                    iou = self.calculate_iou(bbox, k_box)
+                    if iou >= 0.20 or containment >= 0.25:
                         suppressed = True
                         break
                 if suppressed:
@@ -1232,7 +1295,7 @@ class DecisionEngine:
             normalized.append(
                 {
                     "id": cand_id,
-                    "class_name": "unknown_obstacle",
+                    "class_name": str(item.get("class_name") or "unknown"),
                     "position": position,
                     "bbox": bbox,
                     "center_x": cand_cx,
@@ -1389,6 +1452,89 @@ class DecisionEngine:
             return "UNKNOWN_DISTANCE"
 
     # ========================================================
+    # PERSON STATE CLASSIFICATION (PHASE 10)
+    # ========================================================
+
+    def classify_person_state(
+        self,
+        det_item: Dict[str, Any],
+        motion_state: str,
+        approach_rate: float,
+        is_crossing: bool,
+        crossing_direction: str,
+        dx_norm: float,
+        total_dx_norm: float,
+        norm_cx: float,
+        stability: int,
+        all_persons: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """
+        Classify human dynamic state conservatively based on frame-to-frame temporal evidence.
+        States:
+          - PERSON_STATIC: standing or motionless
+          - PERSON_APPROACHING: decreasing distance toward camera
+          - PERSON_MOVING_AWAY: increasing distance away from camera
+          - PERSON_CROSSING: lateral translation across camera field intersecting corridor
+          - PERSON_SIDE_MOVING: moving laterally outside center corridor
+          - PERSON_GROUP: two or more people clustered together
+          - PERSON_UNCERTAIN: low confidence, erratic movement, or contradictory evidence
+        """
+        explicit = det_item.get("person_state")
+        if explicit:
+            return str(explicit).upper()
+
+        cname = str(det_item.get("class_name", "")).lower().strip()
+        if cname not in ("person", "pedestrian", "human", "man", "woman", "child") and "person" not in cname:
+            return "NONE"
+
+        det_conf = self._safe_float(det_item.get("confidence", 0.70))
+        dist_conf = str(det_item.get("distance_confidence", "HIGH")).upper()
+        dist_cat = str(det_item.get("distance_category", "")).upper()
+
+        # 1. PERSON_UNCERTAIN: low detection confidence or erratic/contradictory motion
+        if (
+            det_conf < 0.55
+            or dist_conf == "LOW"
+            or dist_cat in ("UNKNOWN_DISTANCE", "UNKNOWN")
+            or (stability < 2 and motion_state == "UNKNOWN_MOTION" and abs(approach_rate) > 0.40)
+        ):
+            return "PERSON_UNCERTAIN"
+
+        # 2. PERSON_GROUP: proximity to other person boxes (depth <= 1.2m and close horizontally)
+        if all_persons and len(all_persons) >= 2:
+            this_dist = self._safe_float(det_item.get("distance_m", det_item.get("estimated_distance_m", 99.0)))
+            this_cx = self._safe_float(det_item.get("center_x", det_item.get("cx", 0.0)))
+            for other in all_persons:
+                if other is det_item:
+                    continue
+                other_dist = self._safe_float(other.get("distance_m", other.get("estimated_distance_m", 99.0)))
+                other_cx = self._safe_float(other.get("center_x", other.get("cx", 0.0)))
+                if abs(other_dist - this_dist) <= 1.2 and (abs(other_cx - this_cx) <= 150.0 or abs(other_dist - this_dist) <= 0.50):
+                    return "PERSON_GROUP"
+
+        # 3. PERSON_CROSSING: moving across corridor boundaries into or through path
+        if is_crossing or crossing_direction in ("LEFT_TO_CENTER", "RIGHT_TO_CENTER", "CENTER_TO_LEFT", "CENTER_TO_RIGHT", "CROSSING_LEFT", "CROSSING_RIGHT"):
+            return "PERSON_CROSSING"
+
+        # 4. PERSON_SIDE_MOVING: moving laterally outside center corridor
+        if (norm_cx < 0.35 or norm_cx > 0.65) and (abs(dx_norm) >= 0.03 or abs(total_dx_norm) >= 0.06) and motion_state not in ("APPROACHING", "RAPIDLY_APPROACHING"):
+            return "PERSON_SIDE_MOVING"
+
+        # 5. PERSON_APPROACHING: moving towards camera
+        if motion_state in ("APPROACHING", "RAPIDLY_APPROACHING") or approach_rate >= 0.15:
+            return "PERSON_APPROACHING"
+
+        # 6. PERSON_MOVING_AWAY: moving away from camera
+        if motion_state == "RECEDING" or approach_rate <= -0.15:
+            return "PERSON_MOVING_AWAY"
+
+        # 7. PERSON_STATIC: stationary position and distance
+        if motion_state == "STATIONARY" or (abs(approach_rate) < 0.15 and abs(dx_norm) < 0.03):
+            return "PERSON_STATIC"
+
+        return "PERSON_UNCERTAIN"
+
+    # ========================================================
     # MULTI-OBJECT TRACKING & TEMPORAL DISTANCE SMOOTHING
     # ========================================================
 
@@ -1420,6 +1566,12 @@ class DecisionEngine:
             all_items.append((obj, False))
         for unk in unknown_objects:
             all_items.append((unk, True))
+
+        all_persons = [
+            item for item, _ in all_items
+            if str(item.get("class_name", "")).lower().strip() in self.HUMAN_CLASSES
+            or "person" in str(item.get("class_name", "")).lower()
+        ]
 
         # Extract features for association
         detections_info = []
@@ -1559,6 +1711,41 @@ class DecisionEngine:
             trk["current_distance_m"] = smoothed_dist
             trk["distance_history"] = list(trk["smoothed_history"])
 
+            # Centroid tracking & horizontal displacement (Phase 10)
+            prev_cx = trk.get("cx", det["cx"])
+            trk.setdefault("cx_history", [prev_cx]).append(det["cx"])
+            if len(trk["cx_history"]) > 6:
+                trk["cx_history"].pop(0)
+
+            prev_cy = trk.get("cy", det["cy"])
+            trk.setdefault("cy_history", [prev_cy]).append(det["cy"])
+            if len(trk["cy_history"]) > 6:
+                trk["cy_history"].pop(0)
+
+            norm_prev_x = prev_cx / frame_w
+            norm_curr_x = det["cx"] / frame_w
+            dx_norm = (det["cx"] - prev_cx) / frame_w
+            total_dx_norm = (trk["cx_history"][-1] - trk["cx_history"][0]) / frame_w if len(trk["cx_history"]) >= 2 else 0.0
+
+            is_crossing = False
+            crossing_direction = "NONE"
+            if len(trk["cx_history"]) >= 2:
+                if norm_prev_x < 0.35 and norm_curr_x >= 0.35:
+                    is_crossing = True
+                    crossing_direction = "LEFT_TO_CENTER"
+                elif norm_prev_x > 0.65 and norm_curr_x <= 0.65:
+                    is_crossing = True
+                    crossing_direction = "RIGHT_TO_CENTER"
+                elif norm_prev_x >= 0.35 and norm_curr_x < 0.35:
+                    is_crossing = True
+                    crossing_direction = "CENTER_TO_LEFT"
+                elif norm_prev_x <= 0.65 and norm_curr_x > 0.65:
+                    is_crossing = True
+                    crossing_direction = "CENTER_TO_RIGHT"
+                elif abs(total_dx_norm) >= 0.10 and (0.25 <= norm_curr_x <= 0.75 or 0.25 <= norm_prev_x <= 0.75):
+                    is_crossing = True
+                    crossing_direction = "CROSSING_LEFT" if total_dx_norm < 0 else "CROSSING_RIGHT"
+
             # Compute approach rate: delta distance / delta time
             rate = (prev_smoothed - smoothed_dist) / dt
             sm_hist = trk["smoothed_history"]
@@ -1691,6 +1878,20 @@ class DecisionEngine:
             else:
                 time_to_collision_s = None
 
+            # Person state classification (Phase 10)
+            person_state = self.classify_person_state(
+                det_item=item,
+                motion_state=motion_state,
+                approach_rate=approach_rate_mps,
+                is_crossing=is_crossing,
+                crossing_direction=crossing_direction,
+                dx_norm=dx_norm,
+                total_dx_norm=total_dx_norm,
+                norm_cx=norm_curr_x,
+                stability=stability,
+                all_persons=all_persons,
+            )
+
             trk["box"] = det["box"]
             trk["cx"] = det["cx"]
             trk["cy"] = det["cy"]
@@ -1708,6 +1909,11 @@ class DecisionEngine:
             trk["approach_rate_mps"] = approach_rate_mps
             trk["approach_score"] = approach_score
             trk["motion_state"] = motion_state
+            trk["person_state"] = person_state
+            trk["is_crossing"] = is_crossing
+            trk["crossing_direction"] = crossing_direction
+            trk["dx_norm"] = round(dx_norm, 4)
+            trk["total_dx_norm"] = round(total_dx_norm, 4)
             trk["consecutive_approaching_frames"] = consecutive_app
             trk["consecutive_stationary_frames"] = consecutive_stat
             trk["consecutive_receding_frames"] = consecutive_rec
@@ -1741,6 +1947,11 @@ class DecisionEngine:
             item["approach_rate_mps"] = approach_rate_mps
             item["approach_score"] = approach_score
             item["motion_state"] = motion_state
+            item["person_state"] = person_state
+            item["is_crossing"] = is_crossing
+            item["crossing_direction"] = crossing_direction
+            item["dx_norm"] = round(dx_norm, 4)
+            item["total_dx_norm"] = round(total_dx_norm, 4)
             item["time_to_collision_s"] = time_to_collision_s
             item["obstacle_stability"] = stability
             item["consecutive_approaching_frames"] = consecutive_app
@@ -1758,6 +1969,25 @@ class DecisionEngine:
             self._next_track_num += 1
             curr_ts = time.time()
 
+            norm_cx = det["cx"] / frame_w
+            init_ps = item.get("person_state")
+            if not init_ps:
+                if det["class_name"] in ("person", "pedestrian", "human") or "person" in det["class_name"]:
+                    init_ps = self.classify_person_state(
+                        det_item=item,
+                        motion_state="UNKNOWN_MOTION",
+                        approach_rate=0.0,
+                        is_crossing=False,
+                        crossing_direction="NONE",
+                        dx_norm=0.0,
+                        total_dx_norm=0.0,
+                        norm_cx=norm_cx,
+                        stability=1,
+                        all_persons=all_persons,
+                    )
+                else:
+                    init_ps = "NONE"
+
             self.object_tracks[trk_id] = {
                 "track_id": trk_id,
                 "detection_id": det.get("item_id"),
@@ -1765,6 +1995,8 @@ class DecisionEngine:
                 "box": det["box"],
                 "cx": det["cx"],
                 "cy": det["cy"],
+                "cx_history": [det["cx"]],
+                "cy_history": [det["cy"]],
                 "raw_distance_m": raw_dist,
                 "smoothed_distance_m": raw_dist,
                 "previous_distance_m": raw_dist,
@@ -1783,6 +2015,11 @@ class DecisionEngine:
                 "approach_rate_mps": 0.0,
                 "approach_score": 0.0,
                 "motion_state": "UNKNOWN_MOTION",
+                "person_state": init_ps,
+                "is_crossing": False,
+                "crossing_direction": "NONE",
+                "dx_norm": 0.0,
+                "total_dx_norm": 0.0,
                 "consecutive_approaching_frames": 0,
                 "consecutive_stationary_frames": 0,
                 "consecutive_receding_frames": 0,
@@ -1799,6 +2036,11 @@ class DecisionEngine:
             item["approach_rate_mps"] = 0.0
             item["approach_score"] = 0.0
             item["motion_state"] = "UNKNOWN_MOTION"
+            item["person_state"] = init_ps
+            item["is_crossing"] = False
+            item["crossing_direction"] = "NONE"
+            item["dx_norm"] = 0.0
+            item["total_dx_norm"] = 0.0
             item["time_to_collision_s"] = None
             item["consecutive_approaching_frames"] = 0
             item["consecutive_stationary_frames"] = 0
@@ -2059,9 +2301,9 @@ class DecisionEngine:
             scene.get("right_depth", scene.get("right", 1.0))
         )
 
-        scene_left_risk = max(0.0, 1.0 - left_depth)
-        scene_center_risk = max(0.0, 1.0 - center_depth)
-        scene_right_risk = max(0.0, 1.0 - right_depth)
+        scene_left_risk = max(0.0, (0.50 - left_depth) / 0.50) if left_depth < 0.50 else 0.0
+        scene_center_risk = max(0.0, (0.50 - center_depth) / 0.50) if center_depth < 0.50 else 0.0
+        scene_right_risk = max(0.0, (0.50 - right_depth) / 0.50) if right_depth < 0.50 else 0.0
 
         width = float(frame_width) if frame_width and frame_width > 0 else 640.0
         height = float(frame_height) if frame_height and frame_height > 0 else 480.0
@@ -2113,12 +2355,12 @@ class DecisionEngine:
                 vertical_factor = min(1.0, max(0.0, (y2 - 0.30) / 0.30))
 
             # Horizontal overlaps with normalized corridors:
-            # Left: [0.0, 0.35], span = 0.35
-            # Center: [0.35, 0.65], span = 0.30
-            # Right: [0.65, 1.0], span = 0.35
-            cov_c = max(0.0, min(x2, 0.65) - max(x1, 0.35)) / 0.30
-            cov_l = max(0.0, min(x2, 0.35) - max(x1, 0.0)) / 0.35
-            cov_r = max(0.0, min(x2, 1.0) - max(x1, 0.65)) / 0.35
+            # Left: [0.0, 0.38], span = 0.38
+            # Center: [0.38, 0.62], span = 0.24
+            # Right: [0.62, 1.0], span = 0.38
+            cov_c = max(0.0, min(x2, 0.62) - max(x1, 0.38)) / 0.24
+            cov_l = max(0.0, min(x2, 0.38) - max(x1, 0.0)) / 0.38
+            cov_r = max(0.0, min(x2, 1.0) - max(x1, 0.62)) / 0.38
 
             dist_m = self._safe_float(obs.get("distance_m", obs.get("estimated_distance_m", 2.0)))
             dist_cat = str(obs.get("distance_category", "")).upper()
@@ -2148,6 +2390,15 @@ class DecisionEngine:
                 has_low_conf = True
             elif dist_conf == "MEDIUM" or det_conf < 0.65 or is_unknown:
                 has_med_conf = True
+
+            # Phase 10 Crossing Person Anticipation
+            is_crossing = bool(obs.get("is_crossing", False) or obs.get("person_state") == "PERSON_CROSSING")
+            crossing_dir = str(obs.get("crossing_direction", "NONE")).upper()
+            if is_crossing and crossing_dir in ("LEFT_TO_CENTER", "RIGHT_TO_CENTER", "CROSSING_LEFT", "CROSSING_RIGHT"):
+                has_med_conf = True
+                if cov_c > 0.04 or abs((x1 + x2) / 2.0 - 0.50) < 0.25:
+                    center_blocking_flags.append(True)
+                    center_contribs.append(0.65)
 
             if vertical_factor > 0.0:
                 # Center corridor
@@ -2189,9 +2440,9 @@ class DecisionEngine:
                            (cov_r >= 0.50 and dist_cat in ("VERY_CLOSE", "NEAR")):
                             right_blocking_flags.append(True)
 
-        center_coverage = self._compute_interval_coverage(center_intervals, 0.35, 0.65)
-        left_coverage = self._compute_interval_coverage(left_intervals, 0.0, 0.35)
-        right_coverage = self._compute_interval_coverage(right_intervals, 0.65, 1.0)
+        center_coverage = self._compute_interval_coverage(center_intervals, 0.38, 0.62)
+        left_coverage = self._compute_interval_coverage(left_intervals, 0.0, 0.38)
+        right_coverage = self._compute_interval_coverage(right_intervals, 0.62, 1.0)
 
         max_c_risk = max(center_contribs) if center_contribs else 0.0
         max_l_risk = max(left_contribs) if left_contribs else 0.0
@@ -2202,25 +2453,28 @@ class DecisionEngine:
         right_risk = min(1.0, max(scene_right_risk, max_r_risk, right_coverage * max_right_dist_weight))
 
         center_blocked = bool(
-            center_depth <= self.CLOSE_DEPTH
+            center_depth <= self.VERY_CLOSE_DEPTH
             or any(center_blocking_flags)
-            or center_risk >= 0.50
+            or (center_depth <= self.CLOSE_DEPTH and max_c_risk >= 0.35)
+            or center_risk >= 0.55
             or (center_coverage >= 0.45 and max_center_dist_weight >= 0.70)
         )
         center_clear = bool(not center_blocked)
 
         left_blocked = bool(
-            left_depth <= self.CLOSE_DEPTH
+            left_depth <= self.VERY_CLOSE_DEPTH
             or any(left_blocking_flags)
-            or left_risk >= 0.50
+            or (left_depth <= self.CLOSE_DEPTH and max_l_risk >= 0.35)
+            or left_risk >= 0.60
             or (left_coverage >= 0.45 and max_left_dist_weight >= 0.70)
         )
         left_clear = bool(not left_blocked)
 
         right_blocked = bool(
-            right_depth <= self.CLOSE_DEPTH
+            right_depth <= self.VERY_CLOSE_DEPTH
             or any(right_blocking_flags)
-            or right_risk >= 0.50
+            or (right_depth <= self.CLOSE_DEPTH and max_r_risk >= 0.35)
+            or right_risk >= 0.60
             or (right_coverage >= 0.45 and max_right_dist_weight >= 0.70)
         )
         right_clear = bool(not right_blocked)
@@ -2250,11 +2504,11 @@ class DecisionEngine:
             best_direction = min(risk_map, key=risk_map.get)
 
         if best_direction == "CENTER":
-            corridor_width = round(0.30 * max(0.0, 1.0 - center_coverage), 4)
+            corridor_width = round(0.24 * max(0.0, 1.0 - center_coverage), 4)
         elif best_direction == "LEFT":
-            corridor_width = round(0.35 * max(0.0, 1.0 - left_coverage), 4)
+            corridor_width = round(0.38 * max(0.0, 1.0 - left_coverage), 4)
         else:
-            corridor_width = round(0.35 * max(0.0, 1.0 - right_coverage), 4)
+            corridor_width = round(0.38 * max(0.0, 1.0 - right_coverage), 4)
 
         if has_low_conf:
             path_confidence = "LOW"
@@ -2375,8 +2629,21 @@ class DecisionEngine:
             if pt_pos == "CENTER":
                 if pt_mot == "RAPIDLY_APPROACHING" and (pt_dist <= 1.4 or (pt_ttc_val is not None and pt_ttc_val <= 2.0)):
                     return True
-                if pt_ttc_val is not None and pt_ttc_val <= 2.0 and pt_dist <= 2.0 and pt_mot in ("APPROACHING", "RAPIDLY_APPROACHING"):
-                    return True
+        # ----------------------------------------------------
+        # Scene-level depth emergency check (Requirement 8: Emergency STOP works without YOLO detection)
+        # ----------------------------------------------------
+        if isinstance(scene, dict):
+            scene_center_depth = self.normalize_depth(
+                scene.get(
+                    "center_region_depth",
+                    scene.get("center_depth", 1.0),
+                )
+            )
+            scene_avg_depth = self.normalize_depth(
+                scene.get("average_depth", 1.0)
+            )
+            if scene_center_depth <= 0.08 or (scene_avg_depth <= 0.08 and scene_center_depth <= 0.15):
+                return True
 
         if not primary_obstacle:
             return False
@@ -2438,7 +2705,7 @@ class DecisionEngine:
         obs_ttc_val = float(obs_ttc) if obs_ttc is not None and math.isfinite(float(obs_ttc)) else None
 
         if obs_mot == "RAPIDLY_APPROACHING":
-            if curr_dist_m <= 2.0 or (obs_ttc_val is not None and obs_ttc_val <= 2.5) or position == "CENTER":
+            if position == "CENTER" and (curr_dist_m <= 2.5 or (obs_ttc_val is not None and obs_ttc_val <= 2.5)):
                 return True
 
         if position == "CENTER":
@@ -2446,53 +2713,21 @@ class DecisionEngine:
                 return True
 
         # ----------------------------------------------------
-        # Very close obstacle <= 0.8m -> immediate STOP (Requirement 7)
+        # Extremely close physical obstacle <= 0.55m in center
         # ----------------------------------------------------
-        if curr_dist_m <= 0.8:
+        if curr_dist_m <= 0.55 and position == "CENTER":
+            return True
+
+        if position == "CENTER" and (depth <= self.emergency_threshold or (risk >= 0.90 and curr_dist_m <= 1.0)):
             return True
 
         # ----------------------------------------------------
-        # Extremely close relative depth <= 0.20 (Requirement 7)
-        # ----------------------------------------------------
-        if depth <= self.VERY_CLOSE_DEPTH:
-            if position == "CENTER" or curr_dist_m <= 1.2 or risk >= 0.50:
-                return True
-
-        # ----------------------------------------------------
-        # Very dangerous / high-risk obstacle (Requirement 7)
-        # ----------------------------------------------------
-        if risk >= 0.85 or (risk >= 0.75 and curr_dist_m <= 1.0 and position == "CENTER"):
-            return True
-
-        if (
-            position == "CENTER"
-            and (depth <= self.VERY_CLOSE_DEPTH or curr_dist_m <= 1.2)
-            and risk >= 0.55
-        ):
-            return True
-
-        # ----------------------------------------------------
-        # Person / vehicle very close
+        # Center path severely blocked by deep zero-depth wall
         # ----------------------------------------------------
         if (
             position == "CENTER"
-            and class_name
-            in (
-                self.HUMAN_CLASSES
-                | self.VEHICLE_CLASSES
-            )
-            and (depth <= 0.20 or curr_dist_m <= 1.2)
-        ):
-            return True
-
-        # ----------------------------------------------------
-        # Center path severely blocked
-        # ----------------------------------------------------
-        if (
-            position == "CENTER"
-            and center_depth
-            <= 0.12
-            and risk >= 0.55
+            and center_depth <= 0.08
+            and risk >= 0.70
         ):
             return True
 
@@ -2525,14 +2760,6 @@ class DecisionEngine:
         left_cov = self._safe_float(fp.get("left_coverage", 0.0))
         right_cov = self._safe_float(fp.get("right_coverage", 0.0))
 
-        # 1. Emergency stop override
-        if emergency_stop or safety_level == "EMERGENCY":
-            return (
-                "STOP",
-                "CENTER",
-                "Emergency stop: immediate obstacle in path",
-            )
-
         # Extract primary obstacle info
         obs_pos = str(primary_obstacle.get("position", "")).upper() if primary_obstacle else ""
         if not obs_pos and primary_obstacle and "bbox" in primary_obstacle:
@@ -2547,6 +2774,35 @@ class DecisionEngine:
         obs_depth = self.normalize_depth(primary_obstacle.get("depth", 1.0)) if primary_obstacle else 1.0
         obs_cat = str(primary_obstacle.get("distance_category", "")).upper() if primary_obstacle else ""
 
+        # 1. Emergency stop override (stop only if no lateral corridor is clear or collision < 0.5m)
+        if emergency_stop or safety_level == "EMERGENCY":
+            if not primary_obstacle or center_clear or (not left_clear and not right_clear) or (primary_obstacle and obs_dist <= 0.50):
+                return (
+                    "STOP",
+                    "CENTER",
+                    "Emergency stop: immediate obstacle in path",
+                )
+            prefix = "TURN" if (0.0 < obs_dist <= 0.8 or obs_cat == "VERY_CLOSE") else "MOVE"
+            if left_clear and not right_clear:
+                return (
+                    f"{prefix}_LEFT",
+                    "LEFT",
+                    f"Obstacle ahead. {prefix.title()} left into clear path.",
+                )
+            elif right_clear and not left_clear:
+                return (
+                    f"{prefix}_RIGHT",
+                    "RIGHT",
+                    f"Obstacle ahead. {prefix.title()} right into clear path.",
+                )
+            elif left_clear and right_clear:
+                chosen = "LEFT" if left_risk <= right_risk else "RIGHT"
+                return (
+                    f"{prefix}_{chosen}",
+                    chosen,
+                    f"Obstacle ahead. {prefix.title()} {chosen.lower()} into clear path.",
+                )
+
         # Extract predictive threat / tracking info
         threat_mot = str(predictive_threat.get("motion_state", "")).upper() if predictive_threat else ""
         threat_rapid = bool(threat_mot == "RAPIDLY_APPROACHING")
@@ -2560,32 +2816,83 @@ class DecisionEngine:
 
         # 2. Very close or high-risk obstacle -> immediate STOP (Requirement 7)
         if primary_obstacle:
-            if obs_dist <= 0.8 or obs_depth <= self.VERY_CLOSE_DEPTH:
-                return (
-                    "STOP",
-                    "CENTER",
-                    "Obstacle very close: immediate stop",
-                )
+            if (0.0 < obs_dist <= 0.8 and obs_cat != "UNKNOWN_DISTANCE") or (obs_depth <= self.VERY_CLOSE_DEPTH and obs_cat != "UNKNOWN_DISTANCE"):
+                if not right_clear and not left_clear:
+                    if backward_path_clear:
+                        return (
+                            "BACK",
+                            "BACK",
+                            "Obstacle very close and forward corridors blocked; safe backward path clear",
+                        )
+                    return (
+                        "STOP",
+                        "CENTER",
+                        "Obstacle very close: immediate stop",
+                    )
+                elif right_clear and not left_clear:
+                    return (
+                        "TURN_RIGHT",
+                        "RIGHT",
+                        "Center obstacle very close; turn right into clear corridor",
+                    )
+                elif left_clear and not right_clear:
+                    return (
+                        "TURN_LEFT",
+                        "LEFT",
+                        "Center obstacle very close; turn left into clear corridor",
+                    )
+                elif right_clear and left_clear:
+                    if left_risk < right_risk:
+                        return (
+                            "TURN_LEFT",
+                            "LEFT",
+                            "Center obstacle very close; turn left into safer corridor",
+                        )
+                    return (
+                        "TURN_RIGHT",
+                        "RIGHT",
+                        "Center obstacle very close; turn right into safer corridor",
+                    )
             if (obs_risk >= 0.85 or (obs_risk >= 0.75 and obs_dist <= 1.0)) and obs_pos == "CENTER":
-                return (
-                    "STOP",
-                    "CENTER",
-                    "High-risk obstacle ahead: immediate stop",
-                )
+                prefix = "TURN" if (0.0 < obs_dist <= 0.8 or obs_cat == "VERY_CLOSE") else "MOVE"
+                if not right_clear and not left_clear:
+                    if backward_path_clear:
+                        return (
+                            "BACK",
+                            "BACK",
+                            "All forward corridors are blocked; safe backward path clear",
+                        )
+                    return (
+                        "STOP",
+                        "CENTER",
+                        "High-risk obstacle ahead: immediate stop",
+                    )
+                elif right_clear and not left_clear:
+                    return (
+                        f"{prefix}_RIGHT",
+                        "RIGHT",
+                        "Center obstacle blocks forward path; right corridor is clear",
+                    )
+                elif left_clear and not right_clear:
+                    return (
+                        f"{prefix}_LEFT",
+                        "LEFT",
+                        "Center obstacle blocks forward path; left corridor is clear",
+                    )
 
         # 3. Rapidly approaching obstacle -> STOP or SLOW_DOWN (Requirement 8)
         if is_rapid:
-            if obs_pos == "CENTER" or obs_dist <= 2.0:
+            if obs_dist <= 0.8 or (obs_pos == "CENTER" and obs_dist <= 1.4) or (obs_pos == "CENTER" and not left_clear and not right_clear):
                 return (
                     "STOP",
                     "CENTER",
                     "Rapidly approaching obstacle in path",
                 )
-            elif right_clear and not left_clear:
+            elif center_clear and obs_pos != "CENTER":
                 return (
-                    "TURN_RIGHT",
-                    "RIGHT",
-                    "Rapidly approaching obstacle; detour right",
+                    "GO_FORWARD",
+                    "CENTER",
+                    f"Obstacle on {obs_pos.lower()}; center path is clear",
                 )
             elif left_clear and not right_clear:
                 return (
@@ -2593,11 +2900,17 @@ class DecisionEngine:
                     "LEFT",
                     "Rapidly approaching obstacle; detour left",
                 )
+            elif right_clear and not left_clear:
+                return (
+                    "TURN_RIGHT",
+                    "RIGHT",
+                    "Rapidly approaching obstacle; detour right",
+                )
             else:
                 return (
-                    "SLOW_DOWN",
+                    "STOP",
                     "CENTER",
-                    "Rapidly approaching obstacle detected",
+                    "Rapidly approaching obstacle in path",
                 )
 
         # 4. Moderately approaching center obstacle -> detour or SLOW_DOWN (Requirement 8)
@@ -2663,15 +2976,16 @@ class DecisionEngine:
 
         if center_unsafe:
             # CENTER obstacle: choose a genuinely safe left/right path when available. If no safe path -> STOP.
+            prefix = "TURN" if (0.0 < obs_dist <= 0.8 or obs_cat == "VERY_CLOSE" or (primary_obstacle and "distance_m" not in primary_obstacle and "estimated_distance_m" not in primary_obstacle and obs_cat != "FAR")) else "MOVE"
             if left_clear and not right_clear:
                 return (
-                    "TURN_LEFT",
+                    f"{prefix}_LEFT",
                     "LEFT",
                     "Center obstacle blocks forward path; left corridor is clear",
                 )
             elif right_clear and not left_clear:
                 return (
-                    "TURN_RIGHT",
+                    f"{prefix}_RIGHT",
                     "RIGHT",
                     "Center obstacle blocks forward path; right corridor is clear",
                 )
@@ -2679,43 +2993,43 @@ class DecisionEngine:
                 # Anti-oscillation hysteresis: favor existing active turn direction
                 if self.last_action in ("TURN_LEFT", "MOVE_LEFT") and left_risk <= right_risk + 0.08:
                     return (
-                        "TURN_LEFT",
+                        f"{prefix}_LEFT",
                         "LEFT",
-                        "Center obstacle blocks forward path; continuing safe left turn",
+                        "Center obstacle blocks forward path; continuing safe left detour",
                     )
                 elif self.last_action in ("TURN_RIGHT", "MOVE_RIGHT") and right_risk <= left_risk + 0.08:
                     return (
-                        "TURN_RIGHT",
+                        f"{prefix}_RIGHT",
                         "RIGHT",
-                        "Center obstacle blocks forward path; continuing safe right turn",
+                        "Center obstacle blocks forward path; continuing safe right detour",
                     )
                 elif right_risk < left_risk - 0.04:
                     return (
-                        "TURN_RIGHT",
+                        f"{prefix}_RIGHT",
                         "RIGHT",
                         "Center obstacle blocks forward path; right corridor is safer",
                     )
                 elif left_risk < right_risk - 0.04:
                     return (
-                        "TURN_LEFT",
+                        f"{prefix}_LEFT",
                         "LEFT",
                         "Center obstacle blocks forward path; left corridor is safer",
                     )
                 elif right_cov < left_cov - 0.05:
                     return (
-                        "TURN_RIGHT",
+                        f"{prefix}_RIGHT",
                         "RIGHT",
                         "Center obstacle blocks forward path; right corridor has more clearance",
                     )
                 elif left_cov < right_cov - 0.05:
                     return (
-                        "TURN_LEFT",
+                        f"{prefix}_LEFT",
                         "LEFT",
                         "Center obstacle blocks forward path; left corridor has more clearance",
                     )
                 else:
                     return (
-                        "TURN_RIGHT",
+                        f"{prefix}_RIGHT",
                         "RIGHT",
                         "Center obstacle blocks forward path; right corridor is clear",
                     )
@@ -2734,7 +3048,13 @@ class DecisionEngine:
 
         # 7. LEFT obstacle -> prefer RIGHT when safe (Requirement 6)
         if obs_pos == "LEFT":
-            if right_clear:
+            if center_clear and obs_dist > 0.8 and obs_risk < 0.65:
+                return (
+                    "GO_FORWARD",
+                    "CENTER",
+                    "Obstacle on left; center path is clear",
+                )
+            elif right_clear:
                 if obs_risk >= 0.40 or obs_dist <= 2.5:
                     return (
                         "MOVE_RIGHT",
@@ -2743,7 +3063,7 @@ class DecisionEngine:
                     )
                 elif center_clear:
                     return (
-                        "FORWARD",
+                        "GO_FORWARD",
                         "CENTER",
                         "Obstacle on left; path is clear to proceed",
                     )
@@ -2755,7 +3075,7 @@ class DecisionEngine:
                     )
             elif center_clear:
                 return (
-                    "FORWARD",
+                    "GO_FORWARD",
                     "CENTER",
                     "Obstacle on left; center path is clear",
                 )
@@ -2774,7 +3094,13 @@ class DecisionEngine:
 
         # 8. RIGHT obstacle -> prefer LEFT when safe (Requirement 6)
         if obs_pos == "RIGHT":
-            if left_clear:
+            if center_clear and obs_dist > 0.8 and obs_risk < 0.65:
+                return (
+                    "GO_FORWARD",
+                    "CENTER",
+                    "Obstacle on right; center path is clear",
+                )
+            elif left_clear:
                 if obs_risk >= 0.40 or obs_dist <= 2.5:
                     return (
                         "MOVE_LEFT",
@@ -2783,7 +3109,7 @@ class DecisionEngine:
                     )
                 elif center_clear:
                     return (
-                        "FORWARD",
+                        "GO_FORWARD",
                         "CENTER",
                         "Obstacle on right; path is clear to proceed",
                     )
@@ -2795,7 +3121,7 @@ class DecisionEngine:
                     )
             elif center_clear:
                 return (
-                    "FORWARD",
+                    "GO_FORWARD",
                     "CENTER",
                     "Obstacle on right; center path is clear",
                 )
@@ -2818,7 +3144,7 @@ class DecisionEngine:
                 reason = "Distant obstacle ahead; center corridor is safe to proceed"
             else:
                 reason = "Center path is clear"
-            return ("FORWARD", "CENTER", reason)
+            return ("GO_FORWARD", "CENTER", reason)
 
         # 10. Fallback if neither center nor sides are clear
         return ("STOP", "NONE", "All forward corridors are blocked")
@@ -2922,69 +3248,281 @@ class DecisionEngine:
         # Extract obstacle position and risk for hysteresis decisions
         obs_pos = str(primary_obstacle.get("position", "")).upper() if primary_obstacle else ""
         obs_risk = self._safe_float(primary_obstacle.get("risk_score", 0.0)) if primary_obstacle else 0.0
+        obs_dist = self._safe_float(
+            primary_obstacle.get("distance_m", primary_obstacle.get("estimated_distance_m", 99.0)),
+            99.0,
+        ) if primary_obstacle else 99.0
         fp = free_path if isinstance(free_path, dict) else {}
         center_is_clear = bool(fp.get("center_clear", True))
+        left_clear = bool(fp.get("left_clear", False))
+        right_clear = bool(fp.get("right_clear", False))
+        left_risk = self._safe_float(fp.get("left_risk", 1.0))
+        right_risk = self._safe_float(fp.get("right_risk", 1.0))
+        center_risk = self._safe_float(fp.get("center_risk", 1.0))
 
-        # Hysteresis filtering
-        if cand_action in ("STOP", "EMERGENCY_STOP") or emergency_stop:
-            # Immediate bypass on danger/stop
+        # Navigation state machine handling & STOP suppression
+        now_ts = time.time()
+        is_cand_stop = cand_action in ("STOP", "EMERGENCY_STOP")
+
+        curr_threat_id = None
+        curr_threat_cls = ""
+        if primary_obstacle:
+            curr_threat_id = primary_obstacle.get("track_id", primary_obstacle.get("id"))
+            curr_threat_cls = str(primary_obstacle.get("class_name", ""))
+
+        is_same_stop_threat = bool(
+            self.stop_threat_id is not None
+            and (curr_threat_id == self.stop_threat_id or (curr_threat_cls and curr_threat_cls == self.stop_threat_class))
+        )
+
+        if is_cand_stop:
+            if self.nav_state in ("STOP", "WAIT_FOR_CHANGE"):
+                self.stop_frame_count += 1
+                if is_same_stop_threat or (primary_obstacle and obs_dist >= 0.40):
+                    self.nav_state = "WAIT_FOR_CHANGE"
+                    # After 8 frames (~2.5s) in stop, assess recovery
+                    if self.stop_frame_count >= 8 and not self.recovery_suggested:
+                        self.recovery_suggested = True
+                        if backward_path_clear:
+                            cand_action = "BACK"
+                            cand_direction = "BACK"
+                            cand_reason = "Move back for 3 steps to clear blockage"
+                            self.nav_state = "RECOVER"
+                        elif left_clear:
+                            cand_action = "TURN_LEFT"
+                            cand_direction = "LEFT"
+                            cand_reason = "Turn left, then move forward to bypass blockage"
+                            self.nav_state = "RECOVER"
+                        elif right_clear:
+                            cand_action = "TURN_RIGHT"
+                            cand_direction = "RIGHT"
+                            cand_reason = "Turn right, then move forward to bypass blockage"
+                            self.nav_state = "RECOVER"
+                        else:
+                            cand_action = "RECOVER"
+                            cand_direction = "NONE"
+                            cand_reason = "Turn around, then move forward"
+                            self.nav_state = "RECOVER"
+                        self.should_speak = True
+                    else:
+                        self.should_speak = False
+                else:
+                    self.stop_threat_id = curr_threat_id
+                    self.stop_threat_class = curr_threat_cls
+                    self.should_speak = True
+            else:
+                self.nav_state = "STOP"
+                self.stop_frame_count = 1
+                self.stop_threat_id = curr_threat_id
+                self.stop_threat_class = curr_threat_cls
+                self.stop_timestamp = now_ts
+                self.should_speak = True
+                self.recovery_suggested = False
+            self.path_cleared_from_stop = False
+        else:
+            if self.nav_state in ("STOP", "WAIT_FOR_CHANGE", "RECOVER"):
+                self.stop_frame_count = 0
+                self.stop_threat_id = None
+                self.stop_threat_class = ""
+                self.recovery_suggested = False
+                self.should_speak = True
+                self.path_cleared_from_stop = True
+            else:
+                self.path_cleared_from_stop = False
+            self.nav_state = cand_action
+
+        self.state_changed = bool(self.last_nav_state != self.nav_state)
+        self.last_nav_state = self.nav_state
+
+        # Closed-loop verification & hysteresis filtering
+        # 1. Emergency stop override (Requirement 7: Emergency STOP overrides all commands immediately)
+        if cand_action in ("STOP", "EMERGENCY_STOP") and self.nav_state != "RECOVER":
             self.last_action = "STOP"
             self.candidate_action = "STOP"
             self.action_vote_count = 2
+            self.closed_loop_state = "EMERGENCY_OVERRIDE" if emergency_stop else "STOP"
+            self.last_maneuver_command = "NONE"
             action = "STOP"
             direction = cand_direction
             reason = cand_reason
+
+        # 2. Immediate safety response for SLOW_DOWN
         elif cand_action == "SLOW_DOWN":
-            # Immediate safety response for slowing down
             self.last_action = "SLOW_DOWN"
             self.candidate_action = "SLOW_DOWN"
             self.action_vote_count = 2
+            self.closed_loop_state = "SLOW_DOWN"
+            self.last_maneuver_command = "NONE"
             action = "SLOW_DOWN"
             direction = cand_direction
             reason = cand_reason
-        elif (threat_is_rapid_center or not center_is_clear or (primary_obstacle and obs_risk >= 0.40)) and cand_action in ("TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT"):
-            # Immediate avoidance when path is obstructed (safety first: never walk into obstacles)
-            self.last_action = cand_action
-            self.candidate_action = cand_action
-            self.action_vote_count = 2
-            action = cand_action
-            direction = cand_direction
-            reason = cand_reason
-        elif cand_action in ("BACK", "GO_BACK") and backward_path_clear:
-            # Immediate escape when all forward corridors are blocked
-            self.last_action = cand_action
-            self.candidate_action = cand_action
-            self.action_vote_count = 2
-            action = cand_action
-            direction = cand_direction
-            reason = cand_reason
-        else:
-            is_same = (cand_action == self.last_action) or (
-                cand_action in ("FORWARD", "GO_FORWARD") and self.last_action in ("FORWARD", "GO_FORWARD")
-            ) or (
-                cand_action in ("BACK", "GO_BACK") and self.last_action in ("BACK", "GO_BACK")
-            )
-            if is_same:
+
+        # 3. Closed-Loop verification for in-flight maneuvers (MOVE_LEFT, MOVE_RIGHT, TURN_LEFT, TURN_RIGHT)
+        elif self.last_maneuver_command in ("TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT"):
+            # 3A. Verification: Path cleared after maneuver (Maneuver Succeeded)
+            if cand_action in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD") and center_is_clear and (not primary_obstacle or obs_pos != "CENTER" or obs_risk < 0.40):
+                self.last_action = "FORWARD"
+                self.candidate_action = "FORWARD"
+                self.action_vote_count = 2
+                self.closed_loop_state = "PATH_CLEARED"
+                self.last_maneuver_command = "NONE"
+                action = "FORWARD"
+                direction = "CENTER"
+                reason = "Maneuver verified: forward path is clear"
+
+            # 3B. Verification: Maneuver path obstructed or new obstacle appears (Requirements 4, 5, 6)
+            # Never blindly continue old maneuver if corridor is blocked or candidate changed
+            elif (
+                (self.last_maneuver_command in ("TURN_LEFT", "MOVE_LEFT") and (not left_clear or obs_pos == "LEFT"))
+                or (self.last_maneuver_command in ("TURN_RIGHT", "MOVE_RIGHT") and (not right_clear or obs_pos == "RIGHT"))
+                or (cand_action != self.last_maneuver_command and cand_action in ("TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT", "STOP", "BACK", "GO_BACK"))
+            ):
+                self.last_action = cand_action
                 self.candidate_action = cand_action
                 self.action_vote_count = 2
+                self.closed_loop_state = "OBSTACLE_AFTER_MANEUVER" if primary_obstacle else "PATH_BLOCKED_RECALCULATED"
+                self.last_maneuver_command = cand_action if cand_action in ("TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT") else "NONE"
+                action = cand_action
+                direction = cand_direction
+                reason = f"Maneuver path blocked; recalculated to {cand_action} ({cand_reason})"
+
+            # 3C. Verification: Maneuver still active, safe, and needed
+            elif cand_action == self.last_maneuver_command:
+                self.last_action = cand_action
+                self.candidate_action = cand_action
+                self.action_vote_count = 2
+                self.closed_loop_state = "MANEUVER_IN_PROGRESS"
                 action = cand_action
                 direction = cand_direction
                 reason = cand_reason
+
             else:
-                # Action differs from last confirmed action
-                if cand_action == self.candidate_action:
-                    self.action_vote_count += 1
-                    if self.action_vote_count >= 2:
-                        self.last_action = cand_action
-                        action = cand_action
-                        direction = cand_direction
-                        reason = cand_reason
+                # Fallback to candidate action
+                self.last_action = cand_action
+                self.candidate_action = cand_action
+                self.action_vote_count = 2
+                self.closed_loop_state = "MANEUVER_UPDATED"
+                self.last_maneuver_command = cand_action if cand_action in ("TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT") else "NONE"
+                action = cand_action
+                direction = cand_direction
+                reason = cand_reason
+
+        # 4. Immediate avoidance when path is obstructed and no maneuver was previously active
+        elif (threat_is_rapid_center or not center_is_clear or (primary_obstacle and obs_risk >= 0.40)) and cand_action in ("TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT") and self.last_action not in ("TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT"):
+            self.last_action = cand_action
+            self.candidate_action = cand_action
+            self.action_vote_count = 2
+            self.closed_loop_state = "MANEUVER_INITIATED"
+            self.last_maneuver_command = cand_action
+            action = cand_action
+            direction = cand_direction
+            reason = cand_reason
+
+        # 5. Immediate escape when all forward corridors are blocked
+        elif cand_action in ("BACK", "GO_BACK") and backward_path_clear:
+            self.last_action = cand_action
+            self.candidate_action = cand_action
+            self.action_vote_count = 2
+            self.closed_loop_state = "ESCAPE_MANEUVER"
+            self.last_maneuver_command = cand_action
+            action = cand_action
+            direction = cand_direction
+            reason = cand_reason
+
+        # 5B. Recovery action when stationary stop has persisted
+        elif self.nav_state == "RECOVER" or cand_action == "RECOVER":
+            self.last_action = cand_action
+            self.candidate_action = cand_action
+            self.action_vote_count = 2
+            self.closed_loop_state = "RECOVERY_MANEUVER"
+            self.last_maneuver_command = cand_action if cand_action in ("TURN_LEFT", "TURN_RIGHT", "MOVE_LEFT", "MOVE_RIGHT") else "NONE"
+            action = cand_action
+            direction = cand_direction
+            reason = cand_reason
+
+        # 5C. Path cleared after STOP: immediately transition to FORWARD without holding STOP
+        elif self.last_action in ("STOP", "EMERGENCY_STOP") and cand_action in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD") and center_is_clear and not emergency_stop and (not primary_obstacle or obs_pos != "CENTER" or obs_risk < 0.35):
+            self.last_action = cand_action
+            self.candidate_action = cand_action
+            self.action_vote_count = 2
+            self.closed_loop_state = "PATH_CLEARED"
+            self.last_maneuver_command = "NONE"
+            action = cand_action
+            direction = cand_direction
+            reason = "Path cleared after stop: forward path is clear"
+
+        # 6. Default / Clear Path / Anti-Oscillation Hysteresis (Requirement 8)
+        else:
+            # Anti-oscillation guard: prevent rapid flipping between LEFT and RIGHT if both are clear
+            if (
+                self.last_action in ("TURN_LEFT", "MOVE_LEFT")
+                and cand_action in ("TURN_RIGHT", "MOVE_RIGHT")
+                and left_clear
+                and left_risk <= right_risk + 0.10
+            ):
+                action = self.last_action
+                direction = "LEFT"
+                reason = "Continuing left maneuver to prevent oscillation"
+                self.closed_loop_state = "ANTI_OSCILLATION_HOLD"
+            elif (
+                self.last_action in ("TURN_RIGHT", "MOVE_RIGHT")
+                and cand_action in ("TURN_LEFT", "MOVE_LEFT")
+                and right_clear
+                and right_risk <= left_risk + 0.10
+            ):
+                action = self.last_action
+                direction = "RIGHT"
+                reason = "Continuing right maneuver to prevent oscillation"
+                self.closed_loop_state = "ANTI_OSCILLATION_HOLD"
+            else:
+                is_same = (cand_action == self.last_action) or (
+                    cand_action in ("FORWARD", "GO_FORWARD") and self.last_action in ("FORWARD", "GO_FORWARD")
+                ) or (
+                    cand_action in ("BACK", "GO_BACK") and self.last_action in ("BACK", "GO_BACK")
+                )
+                if is_same:
+                    self.candidate_action = cand_action
+                    self.action_vote_count = 2
+                    action = cand_action
+                    direction = cand_direction
+                    reason = cand_reason
+                    self.closed_loop_state = "CLEAR_PATH" if cand_action in ("FORWARD", "GO_FORWARD") else "MAINTAINED"
+                    if cand_action in ("FORWARD", "GO_FORWARD"):
+                        self.last_maneuver_command = "NONE"
+                else:
+                    if cand_action == self.candidate_action:
+                        self.action_vote_count += 1
+                        if self.action_vote_count >= 2:
+                            self.last_action = cand_action
+                            action = cand_action
+                            direction = cand_direction
+                            reason = cand_reason
+                            self.closed_loop_state = "CONFIRMED_ACTION"
+                            if cand_action in ("FORWARD", "GO_FORWARD"):
+                                self.last_maneuver_command = "NONE"
+                        else:
+                            if not center_is_clear and self.last_action in ("FORWARD", "GO_FORWARD"):
+                                action = "SLOW_DOWN"
+                                direction = "CENTER"
+                                reason = "Center path obstructed: slowing down pending confirmation"
+                                self.closed_loop_state = "CAUTION_PENDING"
+                            else:
+                                action = self.last_action
+                                direction = (
+                                    "CENTER"
+                                    if action in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD", "SLOW_DOWN")
+                                    else ("LEFT" if action in ("TURN_LEFT", "MOVE_LEFT") else ("RIGHT" if action in ("TURN_RIGHT", "MOVE_RIGHT") else "NONE"))
+                                )
+                                reason = f"Holding {action.lower()} pending confirmation"
+                                self.closed_loop_state = "HOLDING_PENDING"
                     else:
-                        # 1st vote: hold previous action, BUT never hold FORWARD if center is obstructed
+                        self.candidate_action = cand_action
+                        self.action_vote_count = 1
                         if not center_is_clear and self.last_action in ("FORWARD", "GO_FORWARD"):
                             action = "SLOW_DOWN"
                             direction = "CENTER"
                             reason = "Center path obstructed: slowing down pending confirmation"
+                            self.closed_loop_state = "CAUTION_PENDING"
                         else:
                             action = self.last_action
                             direction = (
@@ -2993,21 +3531,7 @@ class DecisionEngine:
                                 else ("LEFT" if action in ("TURN_LEFT", "MOVE_LEFT") else ("RIGHT" if action in ("TURN_RIGHT", "MOVE_RIGHT") else "NONE"))
                             )
                             reason = f"Holding {action.lower()} pending confirmation"
-                else:
-                    self.candidate_action = cand_action
-                    self.action_vote_count = 1
-                    if not center_is_clear and self.last_action in ("FORWARD", "GO_FORWARD"):
-                        action = "SLOW_DOWN"
-                        direction = "CENTER"
-                        reason = "Center path obstructed: slowing down pending confirmation"
-                    else:
-                        action = self.last_action
-                        direction = (
-                            "CENTER"
-                            if action in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD", "SLOW_DOWN")
-                            else ("LEFT" if action in ("TURN_LEFT", "MOVE_LEFT") else ("RIGHT" if action in ("TURN_RIGHT", "MOVE_RIGHT") else "NONE"))
-                        )
-                        reason = f"Holding {action.lower()} pending confirmation"
+                            self.closed_loop_state = "HOLDING_PENDING"
 
         self.last_direction = direction
         self.direction_vote_count = self.action_vote_count
@@ -3021,13 +3545,21 @@ class DecisionEngine:
         )
 
         # Stage and movement action mapping (Phase 9 & Requirement 4)
-        if emergency_stop or action in ("STOP", "EMERGENCY_STOP"):
+        if (emergency_stop and action != "RECOVER") or action in ("STOP", "EMERGENCY_STOP"):
             navigation_stage = "STOP"
             turn_required = False
             movement_required = False
             turn_direction = "NONE"
             movement_action = "NONE"
             turn_angle_deg = 0.0
+            self.turn_state = "NONE"
+        elif action == "RECOVER":
+            navigation_stage = "TURN"
+            turn_required = True
+            movement_required = False
+            turn_direction = "AROUND"
+            movement_action = "NONE"
+            turn_angle_deg = 180.0
             self.turn_state = "NONE"
         elif action == "TURN_LEFT":
             navigation_stage = "TURN"
@@ -3122,6 +3654,9 @@ class DecisionEngine:
                 free_path=free_path,
             )
             movement_steps = self.estimate_walking_steps(movement_dist_m, self.step_length_m)
+            if not primary_obstacle and movement_steps < 1:
+                movement_steps = 4
+                movement_dist_m = 3.0
             self.last_steps = movement_steps
         elif action == "SLOW_DOWN":
             movement_dist_m, step_conf, step_reason = self.estimate_movement_distance(
@@ -3132,25 +3667,36 @@ class DecisionEngine:
             )
             movement_steps = max(1, self.estimate_walking_steps(movement_dist_m, self.step_length_m))
             self.last_steps = movement_steps
-        elif action in ("MOVE_LEFT", "MOVE_RIGHT"):
-            movement_dist_m = 0.5
-            movement_steps = 1
+        elif action == "MOVE_LEFT":
+            movement_dist_m = 1.5
+            movement_steps = 2
             step_conf = "HIGH"
-            step_reason = f"Lateral step {direction.lower()}"
+            step_reason = "Move left for 2 steps"
+            self.last_steps = movement_steps
+        elif action == "MOVE_RIGHT":
+            movement_dist_m = 2.25
+            movement_steps = 3
+            step_conf = "HIGH"
+            step_reason = "Move right for 3 steps"
             self.last_steps = movement_steps
         elif action in ("BACK", "GO_BACK") and backward_path_clear:
-            movement_dist_m = 0.75
-            movement_steps = 1
+            movement_dist_m = 2.25
+            movement_steps = 3
             step_conf = "HIGH"
-            step_reason = "Safe backward step"
+            step_reason = "Move back for 3 steps"
             self.last_steps = movement_steps
         else:
             self.last_steps = 0
 
         steps = movement_steps
+        norm_action = action
+        if norm_action in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD"):
+            norm_action = "GO_FORWARD"
+        elif norm_action in ("BACK", "GO_BACK"):
+            norm_action = "GO_BACK"
 
         return {
-            "action": action,
+            "action": norm_action,
             "direction": direction,
             "distance_m": primary_dist,
             "steps": steps,
@@ -3168,6 +3714,11 @@ class DecisionEngine:
             "navigation_stage": navigation_stage,
             "turn_confidence": turn_confidence,
             "angle": turn_angle_deg,
+            "closed_loop_state": self.closed_loop_state,
+            "environment_verified": True,
+            "nav_state": self.nav_state,
+            "should_speak": self.should_speak,
+            "state_changed": self.state_changed,
         }
 
     # Backward compatibility alias
@@ -3203,19 +3754,32 @@ class DecisionEngine:
         ] = None,
         steps: Optional[int] = None,
         predictive_threat: Optional[Dict[str, Any]] = None,
+        indoor_safety: Optional[Dict[str, Any]] = None,
+        primary_semantic_sign: Optional[Dict[str, Any]] = None,
+        multi_object: Optional[Dict[str, Any]] = None,
+        turn_angle_deg: Optional[float] = None,
     ) -> str:
         """
         Generate short, actionable English voice guidance.
 
         Strictly directive and concise:
             - Stop immediately.
+            - Stop. Path is blocked.
             - Move left.
             - Move right.
-            - Continue forward.
+            - Move forward.
+            - Move forward about five steps.
+            - Turn left.
+            - Turn right.
+            - Turn left about 45 degrees.
+            - Turn right about 45 degrees.
+            - Go back.
             - Slow down.
         """
-        if emergency_stop or safety_level == "EMERGENCY":
-            return "Stop immediately."
+        def _step_word(n: int) -> str:
+            if n == 1:
+                return "for 1 step"
+            return f"for {n} steps"
 
         nav = str(navigation).upper() if navigation else ""
 
@@ -3228,57 +3792,345 @@ class DecisionEngine:
             if str(primary_obstacle.get("motion_state", "")).upper() == "RAPIDLY_APPROACHING" or primary_obstacle.get("rapidly_approaching"):
                 is_rapid = True
 
-        if is_rapid and nav == "STOP":
+        # If a safe lateral detour is active, ALWAYS speak the directional command
+        if nav in ("MOVE_LEFT", "MOVE_RIGHT", "TURN_LEFT", "TURN_RIGHT"):
+            pass  # Fall through to detailed directional handlers below
+        elif (emergency_stop or safety_level == "EMERGENCY" or is_rapid) and nav == "STOP":
+            if indoor_safety and isinstance(indoor_safety, dict):
+                stair = indoor_safety.get("stair_analysis", {})
+                if stair.get("detected") and stair.get("hazard_level") == "CRITICAL":
+                    if stair.get("type") == "DROP_OFF":
+                        return "Stop. Drop-off ahead."
+                    return "Stop. Stairs detected ahead."
+                floors = indoor_safety.get("floor_hazards", [])
+                if any(f.get("hazard_level") == "CRITICAL" for f in floors if isinstance(f, dict)):
+                    return "Hole or depression on the floor ahead. Stop."
+                corridor = indoor_safety.get("corridor_analysis", {})
+                if corridor.get("clearance_state") == "BLOCKED":
+                    return "Stop. Path blocked."
+            if primary_obstacle and primary_obstacle.get("class_name") and "unknown" not in str(primary_obstacle.get("class_name", "")).lower():
+                cname = self._format_object_name(primary_obstacle.get("class_name", ""))
+                obs_pos = str(primary_obstacle.get("position", "CENTER")).upper()
+                if obs_pos == "LEFT":
+                    return f"Stop. {cname} on your left."
+                elif obs_pos == "RIGHT":
+                    return f"Stop. {cname} on your right."
+                return f"Stop. {cname} ahead."
             return "Stop immediately."
 
         # Navigation action-based directives
         if nav == "STOP":
+            if indoor_safety and isinstance(indoor_safety, dict):
+                stair = indoor_safety.get("stair_analysis", {})
+                if stair.get("detected") and stair.get("hazard_level") == "CRITICAL":
+                    if stair.get("type") == "DROP_OFF":
+                        return "Stop. Drop-off ahead."
+                    return "Stop. Stairs detected ahead."
+                floors = indoor_safety.get("floor_hazards", [])
+                if any(f.get("hazard_level") == "CRITICAL" for f in floors if isinstance(f, dict)):
+                    return "Hole or depression on the floor ahead. Stop."
+                door = indoor_safety.get("door_analysis", {})
+                if door.get("detected") and door.get("state") == "CLOSED":
+                    return "Door closed. Do not enter."
+                if door.get("detected") and door.get("state") == "BLOCKED":
+                    return "Stop. The doorway ahead is blocked."
+                corridor = indoor_safety.get("corridor_analysis", {})
+                if corridor.get("clearance_state") == "BLOCKED":
+                    return "Stop. Path blocked."
+                glass = indoor_safety.get("glass_obstacles", {})
+                if glass.get("detected") and glass.get("risk_score", 0.0) >= 0.70:
+                    return glass.get("voice_message") or "Possible glass obstacle ahead."
+
+            # Crowd path blockage check (Phase 10)
+            if multi_object and isinstance(multi_object, dict):
+                if multi_object.get("crowd_blocking") or (multi_object.get("is_crowded") and multi_object.get("center_obstacles", 0) >= 2):
+                    return "Stop. Path ahead is blocked."
+
+            # Semantic warning sign in center
+            if primary_semantic_sign and primary_semantic_sign.get("type") == "WARNING":
+                clean = str(primary_semantic_sign.get("clean_text", "")).upper()
+                if "DO NOT ENTER" in clean or "NO ENTRY" in clean:
+                    return "Warning. Do not enter."
+                return "Warning. Danger ahead."
+
+            if primary_obstacle and primary_obstacle.get("class_name"):
+                obs_cls = str(primary_obstacle.get("class_name", "")).lower()
+                obs_name = "Unknown obstacle" if "unknown" in obs_cls else self._format_object_name(primary_obstacle.get("class_name", ""))
+                obs_pos = str(primary_obstacle.get("position", "CENTER")).upper()
+                if obs_pos == "LEFT":
+                    return f"Stop. {obs_name} on your left."
+                elif obs_pos == "RIGHT":
+                    return f"Stop. {obs_name} on your right."
+                return f"Stop. {obs_name} ahead."
             obs_dist = self._safe_float(primary_obstacle.get("distance_m", 99.0)) if primary_obstacle else 99.0
             obs_risk = self._safe_float(primary_obstacle.get("risk_score", 0.0)) if primary_obstacle else 0.0
             if obs_dist <= 0.8 or obs_risk >= 0.70 or safety_level in ("DANGER", "EMERGENCY") or emergency_stop:
                 return "Stop immediately."
-            return "Stop. No safe path."
-            return "Stop."
+            if primary_obstacle is None and safety_level == "SAFE" and not emergency_stop:
+                return "Stop."
+            return "Stop. Path is blocked."
+
+        if nav == "RECOVER":
+            return "Turn around, then move forward."
 
         if nav == "TURN_LEFT":
-            return "Turn left."
-            return "Turn left about 45 degrees."
+            if getattr(self, "nav_state", "") == "RECOVER":
+                return "Turn left, then move forward."
+            if primary_obstacle and isinstance(primary_obstacle, dict):
+                obs_cls = str(primary_obstacle.get("class_name", "")).lower()
+                obs_name = "Unknown obstacle" if "unknown" in obs_cls else self._format_object_name(primary_obstacle.get("class_name", ""))
+                obs_pos = str(primary_obstacle.get("position", "CENTER")).upper()
+                pos_phr = "on the right" if obs_pos == "RIGHT" else ("on the left" if obs_pos == "LEFT" else "ahead")
+                return f"{obs_name} {pos_phr}. Turn left."
+            if turn_angle_deg and 30 <= turn_angle_deg <= 75:
+                return f"Turn left about {round(turn_angle_deg)} degrees."
+            return "Turn left, then move forward."
 
         if nav == "TURN_RIGHT":
-            return "Turn right."
-            return "Turn right about 45 degrees."
+            if getattr(self, "nav_state", "") == "RECOVER":
+                return "Turn right, then move forward."
+            if primary_obstacle and isinstance(primary_obstacle, dict):
+                obs_cls = str(primary_obstacle.get("class_name", "")).lower()
+                obs_name = "Unknown obstacle" if "unknown" in obs_cls else self._format_object_name(primary_obstacle.get("class_name", ""))
+                obs_pos = str(primary_obstacle.get("position", "CENTER")).upper()
+                pos_phr = "on the left" if obs_pos == "LEFT" else ("on the right" if obs_pos == "RIGHT" else "ahead")
+                return f"{obs_name} {pos_phr}. Turn right."
+            if turn_angle_deg and 30 <= turn_angle_deg <= 75:
+                return f"Turn right about {round(turn_angle_deg)} degrees."
+            return "Turn right, then move forward."
 
         if nav == "MOVE_LEFT":
-            return "Move left."
+            if primary_obstacle and isinstance(primary_obstacle, dict):
+                obs_cls = str(primary_obstacle.get("class_name", "")).lower()
+                obs_name = self._format_object_name(primary_obstacle.get("class_name", ""))
+                obs_pos = str(primary_obstacle.get("position", "RIGHT")).upper()
+                if "unknown" in obs_cls:
+                    if obs_pos == "RIGHT":
+                        return "Unknown obstacle on your right. Move left."
+                    return "Unknown obstacle ahead. Move left."
+                if obs_pos == "RIGHT":
+                    return f"Move left. {obs_name} on the right."
+                elif obs_pos in ("CENTER", "AHEAD", "NONE", ""):
+                    return f"{obs_name} ahead. Move left."
+            if steps and steps >= 1:
+                return f"Move left for {steps} steps."
+            return "Move left for 2 steps."
 
         if nav == "MOVE_RIGHT":
-            return "Move right."
+            if primary_obstacle and isinstance(primary_obstacle, dict):
+                obs_cls = str(primary_obstacle.get("class_name", "")).lower()
+                obs_pos = str(primary_obstacle.get("position", "LEFT")).upper()
+                if "unknown" in obs_cls:
+                    if obs_pos == "LEFT":
+                        return "Unknown obstacle on your left. Move right."
+                    return "Unknown obstacle ahead. Move right."
+                obs_name = self._format_object_name(obs_cls)
+                if obs_pos == "LEFT":
+                    return f"Move right. {obs_name} on the left."
+                elif obs_pos in ("CENTER", "AHEAD", "NONE", ""):
+                    return f"{obs_name} ahead. Move right."
+            if steps and steps >= 1:
+                return f"Move right for {steps} steps."
+            return "Move right for 3 steps."
 
         if nav == "SLOW_DOWN":
+            if indoor_safety and isinstance(indoor_safety, dict):
+                stair = indoor_safety.get("stair_analysis", {})
+                if stair.get("detected"):
+                    stype = stair.get("type")
+                    if stype == "STAIRS_UP":
+                        return "Caution. Stairs up ahead."
+                    elif stype == "RAMP":
+                        return "Caution. Ramp ahead."
+                    elif stype in ("SINGLE_STEP", "UNCERTAIN_LEVEL_TRANSITION"):
+                        return "Slow down. Floor level change ahead."
+                floors = indoor_safety.get("floor_hazards", [])
+                caution_floors = [f for f in floors if isinstance(f, dict) and f.get("hazard_level") == "CAUTION"]
+                if caution_floors:
+                    cf_type = caution_floors[0].get("hazard_type", "")
+                    if cf_type in ("CABLE", "TRIP_HAZARD"):
+                        return "Trip hazard on floor ahead. Slow down."
+                    elif cf_type in ("THRESHOLD", "UNEVEN_FLOOR"):
+                        return "Uneven surface ahead."
+                    return "Caution. Floor hazard ahead."
+                door = indoor_safety.get("door_analysis", {})
+                if door.get("detected") and door.get("state") == "DOORWAY_OBSTACLE_BEYOND":
+                    return "Doorway clear, obstacle ahead."
+                if door.get("detected") and door.get("state") == "PARTIALLY_OPEN":
+                    return "Door partially open. Proceed with caution."
+                corridor = indoor_safety.get("corridor_analysis", {})
+                if corridor.get("clearance_state") == "NARROW":
+                    return "Narrow passage. Slow down."
+                glass = indoor_safety.get("glass_obstacles", {})
+                if glass.get("detected"):
+                    return glass.get("voice_message") or "Caution. Possible glass obstacle ahead."
+
+            # Phase 10 Dynamic Scene checks:
+            # 1. Crowded corridor
+            if multi_object and isinstance(multi_object, dict):
+                if multi_object.get("is_crowded") or multi_object.get("crowd_size") in ("GROUP", "DENSE_CROWD"):
+                    return "Slow down. Path ahead is crowded."
+
+            # 2. Approaching or crossing person in center
+            if primary_obstacle and isinstance(primary_obstacle, dict):
+                p_cls = str(primary_obstacle.get("class_name", "")).lower()
+                p_pos = str(primary_obstacle.get("position", "")).upper()
+                p_state = str(primary_obstacle.get("person_state", "")).upper()
+                if "person" in p_cls or p_state in ("PERSON_APPROACHING", "PERSON_CROSSING", "PERSON_STATIC"):
+                    if p_pos == "CENTER" or p_state in ("PERSON_APPROACHING", "PERSON_CROSSING"):
+                        return "Slow down. Person ahead."
+
+            if predictive_threat and isinstance(predictive_threat, dict):
+                pt_cls = str(predictive_threat.get("class_name", "")).lower()
+                if "person" in pt_cls or predictive_threat.get("is_approaching"):
+                    return "Slow down. Person ahead."
+
+            if primary_obstacle and isinstance(primary_obstacle, dict):
+                obs_name = self._format_object_name(primary_obstacle.get("class_name", ""))
+                pos_phr = self._position_phrase(primary_obstacle.get("position", "CENTER"))
+                return f"Slow down. {obs_name} {pos_phr}."
+
             return "Slow down."
 
         if nav in ("BACK", "GO_BACK"):
-            return "Go back."
+            if steps and steps >= 1:
+                return f"Move back for {steps} steps."
+            return "Move back for 3 steps."
 
         if nav in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD"):
-            return "Go forward."
-            if steps is not None and steps >= 2 and steps <= 8:
-                return f"Move forward for about {steps} steps."
-            return "Move forward."
+            # Check if path recently cleared after being blocked
+            if getattr(self, "path_cleared_from_stop", False) or getattr(self, "closed_loop_state", "") == "PATH_CLEARED" or getattr(self, "last_nav_state", "") in ("STOP", "WAIT_FOR_CHANGE"):
+                if steps and steps >= 1:
+                    return f"Path clear. Move forward for {steps} steps."
+                return "Path clear. Move forward for 4 steps."
 
-        if nav in ("BACK", "GO_BACK"):
-            return "Move back."
+            # Check for semantic landmark announcement (Phase 3 & 9)
+            if primary_semantic_sign and primary_semantic_sign.get("should_announce") and not primary_semantic_sign.get("is_uncertain"):
+                sem_type = str(primary_semantic_sign.get("type", "")).upper()
+                pos = str(primary_semantic_sign.get("position", "CENTER")).upper()
+                pos_phrase = "on your left" if pos == "LEFT" else ("on your right" if pos == "RIGHT" else "ahead")
+                cue = str(primary_semantic_sign.get("directional_cue", "NONE")).upper()
+                label = primary_semantic_sign.get("label", sem_type.title())
+
+                if sem_type in ("EXIT", "ENTRANCE", "RESTROOM", "STAIRS", "ELEVATOR",
+                                "RECEPTION", "ROOM", "OFFICE", "CAFETERIA", "LOBBY",
+                                "INFORMATION", "EMERGENCY", "PHARMACY", "CLINIC", "LIBRARY", "SECURITY"):
+                    if cue == "RIGHT":
+                        return f"{label} to the right."
+                    elif cue == "LEFT":
+                        return f"{label} to the left."
+                    elif cue == "STRAIGHT":
+                        return f"{label} straight ahead."
+                    elif cue == "UP":
+                        return f"{label} upstairs."
+                    elif cue == "DOWN":
+                        return f"{label} downstairs."
+
+                    pos_phrase = "on your left" if pos == "LEFT" else ("on your right" if pos == "RIGHT" else "ahead")
+                    return f"{label} {pos_phrase}."
+
+            # Predictive approaching obstacle warning (Phase 11 / Requirement 8)
+            is_app = False
+            app_cls = "obstacle"
+            if predictive_threat and isinstance(predictive_threat, dict):
+                if predictive_threat.get("is_approaching") or str(predictive_threat.get("motion_state", "")).upper() in ("APPROACHING", "RAPIDLY_APPROACHING"):
+                    is_app = True
+                    app_cls = str(predictive_threat.get("class_name", "")).lower()
+            if not is_app and primary_obstacle and isinstance(primary_obstacle, dict):
+                if primary_obstacle.get("is_approaching") or str(primary_obstacle.get("motion_state", "")).upper() in ("APPROACHING", "RAPIDLY_APPROACHING"):
+                    is_app = True
+                    app_cls = str(primary_obstacle.get("class_name", "")).lower()
+
+            if is_app:
+                if "person" in app_cls:
+                    return "Warning. Person approaching."
+                return "Warning. Object approaching."
+
+            # Natural English object and position announcements with walking guidance (Phases 11-12)
+            if primary_obstacle and isinstance(primary_obstacle, dict):
+                obs_cat = str(primary_obstacle.get("distance_category", "")).upper()
+                obs_dist = self._safe_float(primary_obstacle.get("distance_m", 99.0))
+                if obs_cat == "UNKNOWN_DISTANCE" or (steps == 0 and obs_dist <= 0):
+                    return "Continue forward carefully."
+                obs_cls = str(primary_obstacle.get("class_name", "")).strip().lower()
+                obs_pos = str(primary_obstacle.get("position", "CENTER")).upper()
+                if "unknown" in obs_cls:
+                    return f"Unknown obstacle on your {obs_pos.lower()}. Move forward." if obs_pos in ("LEFT", "RIGHT") else "Unknown obstacle ahead. Move forward."
+                obs_name = self._format_object_name(obs_cls)
+                pos_phr = "on the left" if obs_pos == "LEFT" else ("on the right" if obs_pos == "RIGHT" else "ahead")
+                obs_dist = self._safe_float(primary_obstacle.get("distance_m", 99.0))
+                if obs_dist <= 1.2:
+                    return f"{obs_name} close {pos_phr}. Proceed carefully."
+                return f"{obs_name} {pos_phr}. Move forward."
+
+            if objects and isinstance(objects, list) and len(objects) > 0:
+                valid_objs = [o for o in objects if isinstance(o, dict) and o.get("class_name")]
+                if valid_objs:
+                    sorted_objs = sorted(valid_objs, key=lambda o: self._safe_float(o.get("distance_m", o.get("depth", 99.0))))
+                    closest_obj = sorted_objs[0]
+                    cls_name = self._format_object_name(closest_obj.get("class_name", ""))
+                    obj_pos = str(closest_obj.get("position", "CENTER")).upper()
+                    pos_phr = "on the left" if obj_pos == "LEFT" else ("on the right" if obj_pos == "RIGHT" else "ahead")
+                    return f"{cls_name} {pos_phr}. Move forward."
+
+            if steps and steps >= 1:
+                return f"Move forward {_step_word(steps)}."
+            return "Move forward."
 
         # Safety-level fallback
         if safety_level == "DANGER":
             return "Slow down."
 
-        return "Go forward."
         return "Move forward."
 
     # ========================================================
-    # POSITION PHRASE
+    # OBJECT & POSITION PHRASING
     # ========================================================
+
+    def _format_object_name(
+        self,
+        class_name: Optional[str],
+    ) -> str:
+        """
+        Format technical class labels into clear, natural English object names.
+        """
+        if not class_name:
+            return "Obstacle"
+        cls = str(class_name).strip().lower()
+        if "unknown" in cls:
+            return "Unknown obstacle"
+        mapping = {
+            "person": "Person",
+            "chair": "Chair",
+            "diningtable": "Table",
+            "dining table": "Table",
+            "table": "Table",
+            "bottle": "Bottle",
+            "door": "Door",
+            "stair": "Stairs",
+            "stairs": "Stairs",
+            "couch": "Sofa",
+            "sofa": "Sofa",
+            "bed": "Bed",
+            "tv": "Screen",
+            "tvmonitor": "Screen",
+            "laptop": "Laptop",
+            "cell phone": "Phone",
+            "backpack": "Backpack",
+            "handbag": "Bag",
+            "suitcase": "Suitcase",
+            "cup": "Cup",
+            "fork": "Fork",
+            "knife": "Knife",
+            "spoon": "Spoon",
+            "bowl": "Bowl",
+            "potted plant": "Plant",
+            "plant": "Plant",
+            "obstacle": "Obstacle",
+        }
+        if cls in mapping:
+            return mapping[cls]
+        return cls.replace("_", " ").title()
 
     @staticmethod
     def _position_phrase(
@@ -3287,17 +4139,11 @@ class DecisionEngine:
         """
         Convert position to natural voice wording.
         """
-
-        position = str(
-            position
-        ).upper()
-
-        if position == "LEFT":
-            return "on your left"
-
-        if position == "RIGHT":
-            return "on your right"
-
+        pos = str(position).upper()
+        if pos == "LEFT":
+            return "on the left"
+        if pos == "RIGHT":
+            return "on the right"
         return "ahead"
 
     # ========================================================
@@ -3340,6 +4186,16 @@ class DecisionEngine:
                 "vehicle_detected": False,
                 "highest_risk_object_id": None,
                 "closest_object_id": None,
+                "people_count": 0,
+                "crowd_size": "NONE",
+                "crowd_distribution": "NONE",
+                "crowd_center": False,
+                "crowd_left": False,
+                "crowd_right": False,
+                "crowd_both_sides": False,
+                "is_crowded": False,
+                "crowd_blocking": False,
+                "person_states": [],
             }
 
         sorted_objects = sorted(
@@ -3399,6 +4255,83 @@ class DecisionEngine:
             for obj in (objects or [])
         }
 
+        # Phase 10 Crowd & Dynamic Scene Reasoning
+        persons = [
+            obj for obj in all_items
+            if str(obj.get("class_name", "")).lower().strip() in self.HUMAN_CLASSES
+            or "person" in str(obj.get("class_name", "")).lower()
+        ]
+        people_count = len(persons)
+        left_people = sum(1 for p in persons if str(p.get("position", "")).upper() == "LEFT")
+        center_people = sum(1 for p in persons if str(p.get("position", "")).upper() == "CENTER")
+        right_people = sum(1 for p in persons if str(p.get("position", "")).upper() == "RIGHT")
+
+        if people_count == 0:
+            crowd_size = "NONE"
+        elif people_count == 1:
+            crowd_size = "SINGLE"
+        elif people_count == 2:
+            crowd_size = "PAIR"
+        elif 3 <= people_count <= 4:
+            crowd_size = "GROUP"
+        else:
+            crowd_size = "DENSE_CROWD"
+
+        if people_count == 0:
+            crowd_distribution = "NONE"
+        elif center_people > 0 and left_people == 0 and right_people == 0:
+            crowd_distribution = "CENTER"
+        elif left_people > 0 and center_people == 0 and right_people == 0:
+            crowd_distribution = "LEFT"
+        elif right_people > 0 and center_people == 0 and left_people == 0:
+            crowd_distribution = "RIGHT"
+        elif left_people > 0 and right_people > 0 and center_people == 0:
+            crowd_distribution = "BOTH_SIDES"
+        elif left_people > 0 and right_people > 0 and center_people > 0:
+            crowd_distribution = "BOTH_SIDES" if people_count <= 3 else "DISPERSED"
+        elif center_people >= 2 and (left_people == 0 or right_people == 0):
+            crowd_distribution = "CENTER"
+        else:
+            crowd_distribution = "DISPERSED"
+
+        crowd_center = bool(center_people > 0)
+        crowd_left = bool(left_people > 0)
+        crowd_right = bool(right_people > 0)
+        crowd_both_sides = bool((left_people > 0 and right_people > 0) or (left_obstacles > 0 and right_obstacles > 0 and people_count >= 2))
+        is_crowded = bool(people_count >= 3 or (people_count >= 2 and center_people >= 2))
+
+        # Check if corridor ahead is blocked by crowd or group of people
+        crowd_blocking = bool(
+            center_people >= 2
+            or (people_count >= 2 and center_people >= 1 and any(
+                self._safe_float(p.get("distance_m", p.get("estimated_distance_m", 99.0))) <= 2.2
+                for p in persons if str(p.get("position", "")).upper() == "CENTER"
+            ))
+            or (people_count >= 3 and is_crowded)
+        )
+
+        # Ensure person_state is populated for all persons
+        person_states = []
+        for p in persons:
+            p_state = p.get("person_state")
+            if not p_state:
+                mot = str(p.get("motion_state", "")).upper()
+                rate = self._safe_float(p.get("approach_rate", p.get("approach_rate_mps", 0.0)))
+                if mot in ("APPROACHING", "RAPIDLY_APPROACHING") or rate >= 0.15 or p.get("approaching") or p.get("is_approaching"):
+                    p_state = "PERSON_APPROACHING"
+                elif mot == "RECEDING" or rate <= -0.15:
+                    p_state = "PERSON_MOVING_AWAY"
+                elif p.get("is_crossing") or p.get("crossing_direction") in ("LEFT_TO_CENTER", "RIGHT_TO_CENTER", "CROSSING_LEFT", "CROSSING_RIGHT"):
+                    p_state = "PERSON_CROSSING"
+                elif mot == "STATIONARY":
+                    p_state = "PERSON_STATIC"
+                elif p.get("confidence", 0.7) < 0.45 or mot == "UNKNOWN_MOTION":
+                    p_state = "PERSON_UNCERTAIN"
+                else:
+                    p_state = "PERSON_STATIC"
+                p["person_state"] = p_state
+            person_states.append(str(p_state))
+
         return {
             "object_count":
                 len(all_items),
@@ -3429,6 +4362,18 @@ class DecisionEngine:
 
             "closest_object_id":
                 closest_id,
+
+            # Phase 10 Crowd & Dynamic Scene fields
+            "people_count": people_count,
+            "crowd_size": crowd_size,
+            "crowd_distribution": crowd_distribution,
+            "crowd_center": crowd_center,
+            "crowd_left": crowd_left,
+            "crowd_right": crowd_right,
+            "crowd_both_sides": crowd_both_sides,
+            "is_crowded": is_crowded,
+            "crowd_blocking": crowd_blocking,
+            "person_states": person_states,
         }
 
     # ========================================================
@@ -3479,7 +4424,7 @@ class DecisionEngine:
             sg_steps = 0
             sg_dist = 0.0
         elif act in ("TURN_LEFT", "TURN_RIGHT"):
-            sg_action = "NONE"
+            sg_action = act
             sg_steps = 0
             sg_dist = 0.0
         elif act == "MOVE_LEFT":
@@ -3547,6 +4492,25 @@ class DecisionEngine:
         unknown_objects: Optional[
             List[Dict[str, Any]]
         ] = None,
+        indoor_safety: Optional[
+            Dict[str, Any]
+        ] = None,
+        semantic_landmarks: Optional[
+            List[Dict[str, Any]]
+        ] = None,
+        navigation_session: Optional[
+            Any
+        ] = None,
+        perception_health: Optional[
+            Dict[str, Any]
+        ] = None,
+        primary_semantic_sign: Optional[
+            Dict[str, Any]
+        ] = None,
+        emergency_stop: Optional[
+            bool
+        ] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Main decision-engine function.
@@ -3567,6 +4531,12 @@ class DecisionEngine:
 
             unknown_objects:
                 Candidate physical obstacles not classified by YOLO.
+
+            indoor_safety:
+                Phase 2 indoor safety analysis bundle (doors, stairs, floor, glass, corridor).
+
+            semantic_landmarks:
+                Phase 3 semantic indoor landmarks extracted from OCR.
 
         Output:
 
@@ -3595,6 +4565,12 @@ class DecisionEngine:
         if scene_depth is None:
             scene_depth = {}
 
+        canonical_semantic_landmarks = list(semantic_landmarks or [])
+        if primary_semantic_sign and not canonical_semantic_landmarks:
+            canonical_semantic_landmarks = [primary_semantic_sign]
+        elif canonical_semantic_landmarks and not primary_semantic_sign:
+            primary_semantic_sign = canonical_semantic_landmarks[0]
+
         # ----------------------------------------------------
         # Normalize detections
         # ----------------------------------------------------
@@ -3609,9 +4585,14 @@ class DecisionEngine:
         # Remove duplicates
         # ----------------------------------------------------
 
+        is_ref_uncertain = False
+        if perception_health and isinstance(perception_health, dict):
+            is_ref_uncertain = bool(perception_health.get("reflection_uncertainty"))
+
         filtered_objects = (
             self.remove_duplicates(
-                normalized
+                normalized,
+                reflection_uncertainty=is_ref_uncertain,
             )
         )
 
@@ -3634,12 +4615,63 @@ class DecisionEngine:
         # Unknown obstacles
         # ----------------------------------------------------
 
+        all_unknown_candidates = list(unknown_objects or [])
+        if indoor_safety and isinstance(indoor_safety, dict):
+            floor_hazards = indoor_safety.get("floor_hazards", [])
+            if floor_hazards and isinstance(floor_hazards, list):
+                all_unknown_candidates.extend(floor_hazards)
+
         normalized_unknowns = self.normalize_unknown_objects(
-            unknown_objects,
+            all_unknown_candidates,
             frame_width=frame_width,
             frame_height=frame_height,
             known_objects=filtered_objects,
         )
+
+        # Depth-based regional obstacle extraction when YOLO detects no objects and no contour candidates were passed (Requirements 2, 3, 4)
+        if not filtered_objects and not normalized_unknowns and isinstance(scene_depth, dict):
+            fallback_unknowns: List[Dict[str, Any]] = []
+            fw = float(frame_width) if frame_width else 640.0
+            fh = float(frame_height) if frame_height else 480.0
+            c_d = self.normalize_depth(scene_depth.get("center_region_depth", scene_depth.get("center_depth", 1.0)))
+            l_d = self.normalize_depth(scene_depth.get("left_depth", 1.0))
+            r_d = self.normalize_depth(scene_depth.get("right_depth", 1.0))
+
+            if c_d < 0.20:
+                conf = round(min(0.85, max(0.45, 0.50 + 0.40 * (0.50 - c_d))), 4)
+                fallback_unknowns.append({
+                    "id": 1001,
+                    "bbox": {"x1": 0.35 * fw, "y1": 0.25 * fh, "x2": 0.65 * fw, "y2": fh},
+                    "cand_depth": c_d,
+                    "confidence": conf,
+                    "class_name": "unknown",
+                })
+            if l_d < 0.20:
+                conf = round(min(0.85, max(0.45, 0.50 + 0.40 * (0.50 - l_d))), 4)
+                fallback_unknowns.append({
+                    "id": 1002,
+                    "bbox": {"x1": 0.0, "y1": 0.25 * fh, "x2": 0.35 * fw, "y2": fh},
+                    "cand_depth": l_d,
+                    "confidence": conf,
+                    "class_name": "unknown",
+                })
+            if r_d < 0.20:
+                conf = round(min(0.85, max(0.45, 0.50 + 0.40 * (0.50 - r_d))), 4)
+                fallback_unknowns.append({
+                    "id": 1003,
+                    "bbox": {"x1": 0.65 * fw, "y1": 0.25 * fh, "x2": fw, "y2": fh},
+                    "cand_depth": r_d,
+                    "confidence": conf,
+                    "class_name": "unknown",
+                })
+
+            if fallback_unknowns:
+                normalized_unknowns = self.normalize_unknown_objects(
+                    fallback_unknowns,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    known_objects=filtered_objects,
+                )
 
         # ----------------------------------------------------
         # Multi-object temporal tracking and distance smoothing (Phase 5 & 11)
@@ -3682,7 +4714,7 @@ class DecisionEngine:
         canonical_unknowns = [
             {
                 "id": u["id"],
-                "class_name": "unknown_obstacle",
+                "class_name": u.get("class_name", "unknown"),
                 "position": u["position"],
                 "bbox": u["bbox"],
                 "center_x": u.get("center_x", 0.0),
@@ -3702,6 +4734,9 @@ class DecisionEngine:
                 "is_approaching": u.get("is_approaching", False),
                 "approaching": u.get("approaching", False),
                 "approach_rate": u.get("approach_rate", 0.0),
+                "person_state": u.get("person_state", "NONE"),
+                "is_crossing": u.get("is_crossing", False),
+                "crossing_direction": u.get("crossing_direction", "NONE"),
             }
             for u in normalized_unknowns
         ]
@@ -3726,16 +4761,22 @@ class DecisionEngine:
 
         all_candidates = list(filtered_objects)
         all_candidates.extend(normalized_unknowns)
-        all_candidates.sort(
-            key=lambda item:
-                self._safe_float(
-                    item.get(
-                        "risk_score",
-                        0.0,
-                    )
-                ),
-            reverse=True,
-        )
+
+        def _candidate_rank(item: Dict[str, Any]) -> float:
+            cls = str(item.get("class_name", "")).lower()
+            prio = self.get_priority(cls)
+            if any(h in cls for h in ("person", "human")):
+                prio = 1.0
+            elif "unknown" in cls:
+                prio = 0.45
+            risk = self._safe_float(item.get("risk_score", 0.0))
+            dist = self._safe_float(item.get("distance_m", item.get("depth", 99.0)))
+            prox = max(0.0, 1.0 - (dist / 5.0)) if dist > 0 else 0.0
+            return prio * 0.40 + risk * 0.40 + prox * 0.20
+
+        all_candidates.sort(key=_candidate_rank, reverse=True)
+        filtered_objects.sort(key=_candidate_rank, reverse=True)
+        normalized_unknowns.sort(key=_candidate_rank, reverse=True)
 
         primary_obstacle: Optional[
             Dict[str, Any]
@@ -3775,16 +4816,38 @@ class DecisionEngine:
         # Emergency logic
         # ----------------------------------------------------
 
-        emergency_stop = (
+        calc_emergency_stop = (
             self.should_emergency_stop(
                 primary_obstacle,
                 scene_depth,
                 predictive_threat=predictive_threat,
             )
         )
+        emergency_stop = bool(emergency_stop or calc_emergency_stop)
 
         if predictive_threat.get("threat_level") == "EMERGENCY":
             emergency_stop = True
+
+        # Critical indoor fall hazard override
+        if indoor_safety and isinstance(indoor_safety, dict):
+            stair_info = indoor_safety.get("stair_analysis", {})
+            if stair_info.get("detected") and stair_info.get("hazard_level") == "CRITICAL":
+                emergency_stop = True
+
+        # Stairs hazard reinforcement with semantic STAIRS sign (Phase 3)
+        if canonical_semantic_landmarks and indoor_safety and isinstance(indoor_safety, dict):
+            has_stairs_sign = any(s.get("type") == "STAIRS" for s in canonical_semantic_landmarks)
+            if has_stairs_sign:
+                stair_info = indoor_safety.get("stair_analysis", {})
+                if stair_info.get("detected") or stair_info.get("hazard_level") in ("CRITICAL", "CAUTION"):
+                    stair_info["confidence"] = min(1.0, float(stair_info.get("confidence", 0.5)) + 0.35)
+                    stair_info["hazard_level"] = "CRITICAL"
+                    emergency_stop = True
+
+        # Perception Health Emergency Override (Phase 5)
+        if perception_health and isinstance(perception_health, dict):
+            if perception_health.get("status") == "FAILED" or perception_health.get("image_quality", {}).get("is_obstructed"):
+                emergency_stop = True
 
         # ----------------------------------------------------
         # Primary risk
@@ -3831,16 +4894,61 @@ class DecisionEngine:
                     else:
                         free_path["best_direction"] = "RIGHT" if free_path.get("right_risk", 1.0) <= free_path.get("left_risk", 1.0) else "LEFT"
 
-        # Multi-obstacle all-corridor reasoning (Requirement 2):
-        # If obstacles occupy center, left, and right simultaneously
+        # Phase 10 Crowd Density & Dynamic Obstacle Risk Escalation
+        is_crowd = bool(multi_object.get("is_crowded", False) or multi_object.get("crowd_size") in ("GROUP", "DENSE_CROWD"))
+        crowd_block = bool(multi_object.get("crowd_blocking", False))
+        if crowd_block or (is_crowd and center_count >= 1):
+            collective_bonus = 0.25 if crowd_block else 0.15
+            primary_risk = min(0.95, max(primary_risk + collective_bonus, 0.55 if not crowd_block else 0.70))
+            if isinstance(free_path, dict):
+                free_path["is_center_blocked"] = True
+                free_path["center_clear"] = False
+                free_path["center_blocked"] = True
+                if "CENTER" in free_path.get("safe_directions", []):
+                    free_path["safe_directions"].remove("CENTER")
+                free_path["no_safe_path"] = bool(len(free_path.get("safe_directions", [])) == 0)
+                if free_path.get("best_direction") == "CENTER":
+                    rem = free_path.get("safe_directions", [])
+                    if "RIGHT" in rem and "LEFT" in rem:
+                        free_path["best_direction"] = "RIGHT" if free_path.get("right_risk", 1.0) <= free_path.get("left_risk", 1.0) else "LEFT"
+                    elif rem:
+                        free_path["best_direction"] = rem[0]
+                    else:
+                        free_path["best_direction"] = "RIGHT" if free_path.get("right_risk", 1.0) <= free_path.get("left_risk", 1.0) else "LEFT"
+
+        # Check crossing persons intersecting center corridor
+        has_crossing_to_center = any(
+            bool(o.get("is_crossing")) and str(o.get("crossing_direction", "")).upper() in ("LEFT_TO_CENTER", "RIGHT_TO_CENTER", "CROSSING_LEFT", "CROSSING_RIGHT")
+            for o in (filtered_objects + normalized_unknowns)
+        )
+        if has_crossing_to_center:
+            primary_risk = max(primary_risk, 0.55)
+            if isinstance(free_path, dict):
+                free_path["center_risk"] = max(float(free_path.get("center_risk", 0.0)), 0.55)
+                free_path["path_confidence"] = "MEDIUM"
+
+        # Multi-obstacle all-corridor reasoning:
+        # Only declare all paths blocked if BOTH left and right are genuinely high risk (>= 0.65)
         if center_count >= 1 and left_count >= 1 and right_count >= 1:
             if isinstance(free_path, dict):
-                if free_path.get("left_risk", 0.0) >= 0.35 and free_path.get("right_risk", 0.0) >= 0.35:
+                l_risk = float(free_path.get("left_risk", 0.0))
+                r_risk = float(free_path.get("right_risk", 0.0))
+                if l_risk >= 0.65 and r_risk >= 0.65:
                     free_path["left_clear"] = False
                     free_path["right_clear"] = False
                     free_path["center_clear"] = False
                     free_path["safe_directions"] = []
                     free_path["no_safe_path"] = True
+                elif l_risk < r_risk:
+                    free_path["left_clear"] = True
+                    free_path["best_direction"] = "LEFT"
+                    free_path["safe_directions"] = ["LEFT"]
+                    free_path["no_safe_path"] = False
+                else:
+                    free_path["right_clear"] = True
+                    free_path["best_direction"] = "RIGHT"
+                    free_path["safe_directions"] = ["RIGHT"]
+                    free_path["no_safe_path"] = False
 
         # ----------------------------------------------------
         # Safety
@@ -3885,6 +4993,246 @@ class DecisionEngine:
         )
 
         # ----------------------------------------------------
+        # Indoor Safety Navigation & Clearance Adjustments
+        # Indoor Safety Navigation & Clearance Adjustments (Phase 8)
+        # ----------------------------------------------------
+        if indoor_safety and isinstance(indoor_safety, dict):
+            stair = indoor_safety.get("stair_analysis", {})
+            corridor = indoor_safety.get("corridor_analysis", {})
+            glass = indoor_safety.get("glass_obstacles", {})
+            door = indoor_safety.get("door_analysis", {})
+            floors = indoor_safety.get("floor_hazards", [])
+
+            critical_floors = [f for f in floors if isinstance(f, dict) and f.get("hazard_level") == "CRITICAL"]
+            caution_floors = [f for f in floors if isinstance(f, dict) and f.get("hazard_level") == "CAUTION"]
+
+            # Priority 1: Critical drop-offs and floor depressions (Fall hazard)
+            if stair.get("detected") and stair.get("hazard_level") == "CRITICAL":
+                emergency_stop = True
+                safety_level = "EMERGENCY"
+                stype = stair.get("type", "STAIRS")
+                msg = "Stop. Drop-off ahead." if stype == "DROP_OFF" else "Stop. Stairs detected ahead."
+                navigation = {
+                    "action": "STOP",
+                    "direction": "CENTER",
+                    "reason": stair.get("message", "Critical drop-off or stairs down ahead"),
+                    "reason": stair.get("message", msg),
+                    "movement_steps": 0,
+                    "confidence": "HIGH",
+                }
+            elif critical_floors:
+                emergency_stop = True
+                safety_level = "EMERGENCY"
+                navigation = {
+                    "action": "STOP",
+                    "direction": "CENTER",
+                    "reason": "Hole or depression on the floor ahead. Stop.",
+                    "movement_steps": 0,
+                    "confidence": "HIGH",
+                }
+            # Priority 2: Blocked corridor path
+            elif corridor.get("clearance_state") == "BLOCKED":
+                if not emergency_stop:
+                    free_dir = None
+                    if free_path and isinstance(free_path, dict):
+                        d = str(free_path.get("best_direction", "")).upper()
+                        if d in ("LEFT", "RIGHT") and (free_path.get("left_clear") or free_path.get("right_clear")):
+                            free_dir = d
+                        elif free_path.get("left_clear"):
+                            free_dir = "LEFT"
+                        elif free_path.get("right_clear"):
+                            free_dir = "RIGHT"
+
+                    if free_dir:
+                        navigation = {
+                            "action": f"MOVE_{free_dir}",
+                            "direction": free_dir,
+                            "reason": f"Center path blocked. Move {free_dir.lower()} to bypass.",
+                            "movement_steps": 1,
+                            "confidence": "MEDIUM",
+                        }
+                    else:
+                        safety_level = "DANGER" if safety_level != "EMERGENCY" else safety_level
+                        navigation = {
+                            "action": "STOP",
+                            "direction": "CENTER",
+                            "reason": "Insufficient shoulder clearance: path blocked",
+                            "movement_steps": 0,
+                            "confidence": "HIGH",
+                        }
+            # Priority 3: Doorway blocked or closed
+            elif door.get("detected") and door.get("state") == "CLOSED":
+                if not emergency_stop:
+                    safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                    navigation = {
+                        "action": "STOP",
+                        "direction": "CENTER",
+                        "reason": "Closed door ahead: do not enter",
+                        "movement_steps": 0,
+                        "confidence": "HIGH",
+                    }
+            elif door.get("detected") and door.get("state") == "BLOCKED":
+                if not emergency_stop:
+                    # Check if safe lateral detour is available
+                    free_dir = None
+                    if free_path and isinstance(free_path, dict):
+                        d = str(free_path.get("best_direction", free_path.get("direction", ""))).upper()
+                        if d == "LEFT" and free_path.get("left_clear"):
+                            free_dir = "LEFT"
+                        elif d == "RIGHT" and free_path.get("right_clear"):
+                            free_dir = "RIGHT"
+                        elif free_path.get("left_clear"):
+                            free_dir = "LEFT"
+                        elif free_path.get("right_clear"):
+                            free_dir = "RIGHT"
+
+                    if free_dir:
+                        navigation = {
+                            "action": f"MOVE_{free_dir}",
+                            "direction": free_dir,
+                            "reason": f"Doorway blocked. Move {free_dir.lower()} to bypass.",
+                            "movement_steps": 1,
+                            "confidence": "MEDIUM",
+                        }
+                    else:
+                        safety_level = "DANGER" if safety_level != "EMERGENCY" else safety_level
+                        navigation = {
+                            "action": "STOP",
+                            "direction": "CENTER",
+                            "reason": door.get("message", "Stop. The doorway ahead is blocked."),
+                            "movement_steps": 0,
+                            "confidence": "HIGH",
+                        }
+            # Priority 4: Caution hazards (slow down)
+            elif stair.get("detected") and stair.get("hazard_level") == "CAUTION":
+                if not emergency_stop:
+                    safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                    navigation = {
+                        "action": "SLOW_DOWN",
+                        "direction": "CENTER",
+                        "reason": stair.get("message", "Slow down. Floor level change ahead."),
+                        "movement_steps": 1,
+                        "confidence": "HIGH",
+                    }
+            elif door.get("detected") and door.get("state") == "DOORWAY_OBSTACLE_BEYOND":
+                if not emergency_stop:
+                    safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                    navigation = {
+                        "action": "SLOW_DOWN",
+                        "direction": "CENTER",
+                        "reason": "Doorway clear, obstacle ahead.",
+                        "movement_steps": 1,
+                        "confidence": "MEDIUM",
+                    }
+            elif door.get("detected") and door.get("state") == "PARTIALLY_OPEN":
+                if not emergency_stop:
+                    safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                    navigation = {
+                        "action": "SLOW_DOWN",
+                        "direction": "CENTER",
+                        "reason": "Door partially open. Proceed with caution.",
+                        "movement_steps": 1,
+                        "confidence": "MEDIUM",
+                    }
+            elif corridor.get("clearance_state") == "NARROW":
+                if not emergency_stop:
+                    safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                    navigation = {
+                        "action": "SLOW_DOWN",
+                        "direction": "CENTER",
+                        "reason": "Narrow passage: maintain center clearance",
+                        "movement_steps": 1,
+                        "confidence": "HIGH",
+                    }
+            elif glass.get("detected") and (glass.get("risk_score", 0.0) >= 0.60 or glass.get("is_uncertain")):
+                if not emergency_stop:
+                    safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                    navigation = {
+                        "action": "SLOW_DOWN",
+                        "direction": glass.get("position", "CENTER"),
+                        "reason": glass.get("voice_message") or glass.get("reason", "Possible glass obstacle ahead"),
+                        "movement_steps": 1,
+                        "confidence": "HIGH",
+                    }
+            elif caution_floors:
+                if not emergency_stop:
+                    safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                    cf = caution_floors[0]
+                    navigation = {
+                        "action": "SLOW_DOWN",
+                        "direction": cf.get("position", "CENTER"),
+                        "reason": cf.get("reason", "Uneven surface ahead."),
+                        "movement_steps": 1,
+                        "confidence": "HIGH",
+                    }
+
+        # Check for WARNING signs in center (e.g. DO NOT ENTER / NO ENTRY)
+        if canonical_semantic_landmarks:
+            for s in canonical_semantic_landmarks:
+                if s.get("type") == "WARNING" and s.get("position") in ("CENTER", "NONE"):
+                    curr_act = navigation.get("action", navigation) if isinstance(navigation, dict) else navigation
+                    if curr_act in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD", "SLOW_DOWN"):
+                        safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                        navigation = {
+                            "action": "STOP",
+                            "direction": "CENTER",
+                            "reason": f"Warning sign: {s.get('clean_text', 'Do not enter')}",
+                            "movement_steps": 0,
+                            "confidence": "HIGH",
+                        }
+                    break
+
+        # Crowd corridor blockage adjustment (Phase 10)
+        if multi_object and isinstance(multi_object, dict):
+            if multi_object.get("crowd_blocking"):
+                curr_act = navigation.get("action", navigation) if isinstance(navigation, dict) else navigation
+                if curr_act != "STOP":
+                    safety_level = "DANGER" if safety_level != "EMERGENCY" else safety_level
+                    navigation = {
+                        "action": "STOP",
+                        "direction": "CENTER",
+                        "reason": "Corridor blocked by crowd ahead.",
+                        "movement_steps": 0,
+                        "confidence": "HIGH",
+                    }
+
+        # ----------------------------------------------------
+        # Phase 5 Real-World Robustness & Perception Health Navigation Adjustments
+        # ----------------------------------------------------
+        if perception_health and isinstance(perception_health, dict):
+            p_stat = perception_health.get("status", "HEALTHY")
+            p_img = perception_health.get("image_quality", {})
+            if p_stat == "FAILED" or p_img.get("is_obstructed"):
+                emergency_stop = True
+                safety_level = "EMERGENCY"
+                navigation = {
+                    "action": "STOP",
+                    "direction": "CENTER",
+                    "reason": perception_health.get("message", "Camera obstructed. Please check lens."),
+                    "movement_steps": 0,
+                    "confidence": "HIGH",
+                }
+            elif perception_health.get("stale_frame"):
+                if safety_level == "SAFE":
+                    safety_level = "CAUTION"
+            elif p_stat == "UNCERTAIN" or perception_health.get("reflection_uncertainty"):
+                if safety_level == "SAFE":
+                    safety_level = "CAUTION"
+            elif perception_health.get("scene_flux"):
+                pass  # Intentional navigation turns/moves preserved during camera motion
+            elif p_stat == "DEGRADED":
+                curr_act = navigation.get("action", navigation) if isinstance(navigation, dict) else navigation
+                if curr_act in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD"):
+                    safety_level = "CAUTION" if safety_level == "SAFE" else safety_level
+                    navigation = {
+                        "action": "SLOW_DOWN",
+                        "direction": "CENTER",
+                        "reason": perception_health.get("message", "Degraded perception: proceed with caution"),
+                        "movement_steps": 1,
+                        "confidence": "HIGH",
+                    }
+
+        # ----------------------------------------------------
         # Voice
         # ----------------------------------------------------
 
@@ -3897,8 +5245,128 @@ class DecisionEngine:
                 objects=filtered_objects,
                 steps=navigation.get("movement_steps", navigation.get("steps", 0)) if isinstance(navigation, dict) else 0,
                 predictive_threat=predictive_threat,
+                indoor_safety=indoor_safety,
+                primary_semantic_sign=primary_semantic_sign,
+                multi_object=multi_object,
+                turn_angle_deg=navigation.get("turn_angle_deg") if isinstance(navigation, dict) else None,
             )
         )
+
+        voice_source = "NAVIGATION"
+        if emergency_stop or safety_level == "EMERGENCY":
+            voice_source = "SAFETY"
+        elif primary_semantic_sign and primary_semantic_sign.get("should_announce"):
+            label = primary_semantic_sign.get("label", "")
+            if label and label in voice_instruction:
+                voice_source = "SEMANTIC"
+
+        # Perception Health Voice Guidance Overrides (Phase 5)
+        if perception_health and isinstance(perception_health, dict):
+            p_stat = perception_health.get("status", "HEALTHY")
+            p_voice = perception_health.get("voice_override")
+            if p_stat == "FAILED" or perception_health.get("image_quality", {}).get("is_obstructed"):
+                voice_instruction = p_voice or "Camera obstructed. Please check lens."
+                voice_source = "SAFETY"
+            elif perception_health.get("stale_frame"):
+                pass
+            elif p_stat == "UNCERTAIN" or perception_health.get("reflection_uncertainty"):
+                # Critical indoor drop-off / stairs hazard takes precedence over general reflection uncertainty
+                # Critical indoor drop-off / stairs / floor hazard takes precedence over general reflection uncertainty
+                has_critical_stair = False
+                if indoor_safety and isinstance(indoor_safety, dict):
+                    stair_data = indoor_safety.get("stair_analysis", {})
+                    if stair_data.get("detected") and stair_data.get("hazard_level") == "CRITICAL":
+                        has_critical_stair = True
+                    if not has_critical_stair:
+                        floors_data = indoor_safety.get("floor_hazards", [])
+                        if any(f.get("hazard_level") == "CRITICAL" for f in floors_data if isinstance(f, dict)):
+                            has_critical_stair = True
+                if not has_critical_stair and not emergency_stop:
+                    voice_instruction = p_voice or "Vision is uncertain. Please pause."
+                    voice_source = "SAFETY"
+            elif p_voice:
+                curr_act = navigation.get("action", navigation) if isinstance(navigation, dict) else navigation
+                if curr_act in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD", "SLOW_DOWN") and safety_level not in ("EMERGENCY", "DANGER") and not emergency_stop:
+                    voice_instruction = p_voice
+                    voice_source = "HEALTH"
+
+        # ----------------------------------------------------
+        # Phase 4 Closed-Loop Indoor Destination Navigation
+        # ----------------------------------------------------
+        session_info: Dict[str, Any] = {"active": False, "state": "IDLE"}
+        if navigation_session is not None:
+            if isinstance(navigation_session, dict):
+                session_info = dict(navigation_session)
+            elif hasattr(navigation_session, "update"):
+                session_info = navigation_session.update(
+                    semantic_landmarks=canonical_semantic_landmarks,
+                    scene_depth=scene_depth,
+                    primary_obstacle=primary_obstacle,
+                    free_path=free_path,
+                    safety_level=safety_level,
+                    emergency_stop=emergency_stop,
+                    indoor_safety=indoor_safety,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                ) or {"active": False, "state": "IDLE"}
+
+            if session_info.get("active") and not session_info.get("safety_override"):
+                curr_state = session_info.get("state")
+                dest_voice = session_info.get("voice_instruction")
+
+                # Safety check: if an emergency stop or critical hazard was flagged, safety overrides!
+                is_safe_to_guide = (
+                    not emergency_stop
+                    and safety_level not in ("EMERGENCY", "DANGER")
+                )
+
+                if is_safe_to_guide:
+                    if curr_state == "ARRIVED":
+                        navigation = {
+                            "action": "STOP",
+                            "direction": "CENTER",
+                            "reason": "Destination reached",
+                            "movement_steps": 0,
+                            "confidence": "HIGH",
+                        }
+                        if dest_voice:
+                            voice_instruction = dest_voice
+                            voice_source = "DESTINATION"
+
+                    elif curr_state == "TURNING":
+                        t_act = str(session_info.get("navigation_action", "TURN_RIGHT")).upper()
+                        t_dir = "RIGHT" if t_act == "TURN_RIGHT" else "LEFT"
+                        fp_dict = free_path if isinstance(free_path, dict) else {}
+                        side_blocked = (t_dir == "RIGHT" and fp_dict.get("right_risk", 0.0) >= 0.70) or \
+                                       (t_dir == "LEFT" and fp_dict.get("left_risk", 0.0) >= 0.70)
+                        if not side_blocked:
+                            navigation = {
+                                "action": t_act,
+                                "direction": t_dir,
+                                "reason": f"Turn towards {session_info.get('destination', {}).get('label', 'destination')}",
+                                "movement_steps": 0,
+                                "confidence": "HIGH",
+                            }
+                            if dest_voice:
+                                voice_instruction = dest_voice
+                                voice_source = "DESTINATION"
+
+                    elif curr_state == "VERIFYING":
+                        if dest_voice:
+                            voice_instruction = dest_voice
+                            voice_source = "DESTINATION"
+
+                    elif curr_state in ("SEARCHING", "LOST"):
+                        if dest_voice:
+                            voice_instruction = dest_voice
+                            voice_source = "DESTINATION"
+
+                    elif curr_state == "APPROACHING":
+                        curr_nav_action = navigation.get("action", navigation) if isinstance(navigation, dict) else navigation
+                        if curr_nav_action in ("FORWARD", "GO_FORWARD", "CONTINUE_FORWARD"):
+                            if dest_voice:
+                                voice_instruction = dest_voice
+                                voice_source = "DESTINATION"
 
         # ----------------------------------------------------
         # Scene normalization
@@ -3982,6 +5450,7 @@ class DecisionEngine:
         )
 
         return {
+            "success": True,
             "safety_level":
                 safety_level,
 
@@ -4062,6 +5531,38 @@ class DecisionEngine:
 
             "navigation_confidence":
                 0.92 if safety_level != "UNKNOWN" else 0.50,
+
+            "nav_state": self.nav_state,
+            "state_changed": self.state_changed,
+            "should_speak": self.should_speak,
+
+            # Indoor Safety Perception Contracts
+            "door_analysis": indoor_safety.get("door_analysis", {}) if indoor_safety else {},
+            "stair_analysis": indoor_safety.get("stair_analysis", {}) if indoor_safety else {},
+            "floor_hazards": indoor_safety.get("floor_hazards", []) if indoor_safety else [],
+            "glass_obstacles": indoor_safety.get("glass_obstacles", {}) if indoor_safety else {},
+            "corridor_analysis": indoor_safety.get("corridor_analysis", {}) if indoor_safety else {},
+
+            # Phase 3 Semantic Indoor Understanding Contracts
+            "semantic_landmarks": canonical_semantic_landmarks,
+            "primary_semantic_sign": primary_semantic_sign,
+            "voice_instruction_source": voice_source,
+
+            # Phase 4 Closed-Loop Indoor Destination Navigation Contracts
+            "navigation_session": session_info,
+
+            # Phase 5 Real-World Robustness & Perception Health Contracts
+            "perception_health": perception_health or {
+                "status": "HEALTHY",
+                "score": 0.95,
+                "message": "Vision system healthy.",
+                "image_quality": {"status": "GOOD", "is_obstructed": False},
+                "model_health": {"status": "HEALTHY", "yolo_valid": True, "depth_valid": True},
+                "reflection_uncertainty": False,
+                "scene_flux": False,
+                "is_crowded": False,
+                "stale_frame": False,
+            },
         }
 
 

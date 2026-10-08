@@ -246,6 +246,7 @@ const CameraView = forwardRef<
             {
               quality: imageQuality,
               skipProcessing: true,
+              shutterSound: false,
             }
           );
 
@@ -513,6 +514,7 @@ const CameraView = forwardRef<
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
         facing={facing}
+        mute={true}
       />
 
       {/* -------------------------------------------------- */}
@@ -552,6 +554,28 @@ const CameraView = forwardRef<
             ? "LIVE DETECTION"
             : "DETECTION STOPPED"}
         </Text>
+
+        {response?.perception_health && response.perception_health.status !== "HEALTHY" && (
+          <View
+            style={[
+              styles.healthBadge,
+              {
+                backgroundColor:
+                  response.perception_health.status === "FAILED"
+                    ? COLORS.danger
+                    : response.perception_health.status === "UNCERTAIN"
+                      ? COLORS.caution
+                      : COLORS.aware,
+              },
+            ]}
+            accessible={true}
+            accessibilityLabel={`Vision health: ${response.perception_health.status}. ${response.perception_health.message}`}
+          >
+            <Text style={styles.healthText}>
+              {response.perception_health.status}
+            </Text>
+          </View>
+        )}
 
         {capturing && (
           <ActivityIndicator
@@ -762,6 +786,19 @@ const styles = StyleSheet.create({
     color: COLORS.white,
     fontSize: 12,
     fontWeight: "900",
+  },
+
+  healthBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+
+  healthText: {
+    color: COLORS.white,
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 0.5,
   },
 
   errorCard: {

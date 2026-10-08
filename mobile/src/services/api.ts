@@ -342,7 +342,16 @@ function uploadFormData(
   timeoutMs: number = REQUEST_TIMEOUT_MS
 ): Promise<{ status: number; text: string; ok: boolean }> {
   return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
+    let xhr: XMLHttpRequest | null = new XMLHttpRequest();
+
+    const cleanup = () => {
+      if (xhr) {
+        xhr.onload = null;
+        xhr.onerror = null;
+        xhr.ontimeout = null;
+        xhr = null;
+      }
+    };
 
     xhr.open("POST", url);
     xhr.timeout = timeoutMs;
@@ -351,17 +360,21 @@ function uploadFormData(
     xhr.setRequestHeader("Accept", "application/json");
 
     xhr.onload = () => {
-      resolve({
-        status: xhr.status,
-        text: xhr.responseText ?? "",
-        ok: xhr.status >= 200 && xhr.status < 300,
-      });
+      const res = {
+        status: xhr?.status ?? 0,
+        text: xhr?.responseText ?? "",
+        ok: (xhr?.status ?? 0) >= 200 && (xhr?.status ?? 0) < 300,
+      };
+      cleanup();
+      resolve(res);
     };
 
     xhr.onerror = () => {
+      const status = xhr?.status ?? 0;
+      cleanup();
       const err = new Error(
-        xhr.status
-          ? `HTTP connection failed (status ${xhr.status})`
+        status
+          ? `HTTP connection failed (status ${status})`
           : "Network unreachable or connection refused"
       );
       err.name = "NetworkError";
@@ -369,6 +382,7 @@ function uploadFormData(
     };
 
     xhr.ontimeout = () => {
+      cleanup();
       const err = new Error(`Request timed out after ${timeoutMs} ms`);
       err.name = "TimeoutError";
       reject(err);
@@ -377,6 +391,7 @@ function uploadFormData(
     try {
       xhr.send(formData);
     } catch (sendError) {
+      cleanup();
       const err = new Error(
         `Multipart/FormData send error: ${getErrorMessage(sendError)}`
       );
@@ -407,6 +422,7 @@ export async function detectImage(
         type: "image/jpeg",
       } as any
     );
+    formData.append("timestamp", String(Date.now() / 1000.0));
   } catch (formError) {
     console.warn("[SmartVision API] FormData construction failed:", formError);
     return {
@@ -418,7 +434,7 @@ export async function detectImage(
   const detectUrl = getDetectUrl();
 
   try {
-    const LIVE_FRAME_TIMEOUT_MS = 6000;
+    const LIVE_FRAME_TIMEOUT_MS = 4000;
     const result = await uploadFormData(
       detectUrl,
       formData,
@@ -561,6 +577,76 @@ export function getApiError(
   }
 
   return response.error ?? "SmartVisionAI backend error.";
+}
+
+/* =========================================================
+   Phase 4 Closed-Loop Indoor Destination Navigation
+   ========================================================= */
+
+export async function startDestinationNavigation(
+  destination: string,
+  type?: string,
+  identifier?: string
+): Promise<{ success: boolean; message?: string; session?: any; error?: string }> {
+  try {
+    const url = `${getRuntimeBackendUrl()}/navigation/start`;
+    const response = await request(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ destination, type, identifier }),
+      },
+      5000
+    );
+    const data = await parseJson<any>(response);
+    return data ?? { success: false, error: "Invalid response" };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function stopDestinationNavigation(): Promise<{
+  success: boolean;
+  message?: string;
+  session?: any;
+  error?: string;
+}> {
+  try {
+    const url = `${getRuntimeBackendUrl()}/navigation/stop`;
+    const response = await request(
+      url,
+      {
+        method: "POST",
+      },
+      5000
+    );
+    const data = await parseJson<any>(response);
+    return data ?? { success: false, error: "Invalid response" };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function getDestinationNavigationStatus(): Promise<{
+  success: boolean;
+  session?: any;
+  error?: string;
+}> {
+  try {
+    const url = `${getRuntimeBackendUrl()}/navigation/status`;
+    const response = await request(
+      url,
+      {
+        method: "GET",
+      },
+      5000
+    );
+    const data = await parseJson<any>(response);
+    return data ?? { success: false, error: "Invalid response" };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
 }
 
 /* =========================================================

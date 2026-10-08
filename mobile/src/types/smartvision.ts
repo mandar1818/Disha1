@@ -71,6 +71,30 @@ export type MotionState =
   | "RECEDING"
   | "UNKNOWN_MOTION";
 
+export type PersonState =
+  | "PERSON_STATIC"
+  | "PERSON_APPROACHING"
+  | "PERSON_MOVING_AWAY"
+  | "PERSON_CROSSING"
+  | "PERSON_SIDE_MOVING"
+  | "PERSON_GROUP"
+  | "PERSON_UNCERTAIN";
+
+export type CrowdSize =
+  | "NONE"
+  | "SINGLE"
+  | "PAIR"
+  | "GROUP"
+  | "DENSE_CROWD";
+
+export type CrowdDistribution =
+  | "NONE"
+  | "CENTER"
+  | "LEFT"
+  | "RIGHT"
+  | "BOTH_SIDES"
+  | "DISPERSED";
+
 export type PredictiveThreatLevel =
   | "EMERGENCY"
   | "DANGER"
@@ -171,6 +195,11 @@ export interface DetectionObject {
   approach_score?: number;
   is_approaching?: boolean;
 
+  // Phase 10 Dynamic Scene & Person States
+  person_state?: PersonState | string;
+  is_crossing?: boolean;
+  crossing_direction?: string;
+
   // Backward compatibility fields
   depth?: number | string;
   estimated_distance?: number | string;
@@ -233,6 +262,10 @@ export interface NormalizedDetection extends DetectionObject {
   depthValue: number;
 
   riskScore: number;
+
+  distanceText?: string;
+
+  safetyLabel?: string;
 }
 
 /* =========================================================
@@ -306,6 +339,18 @@ export interface MultipleObjects {
   vehicle_detected: boolean;
   highest_risk_object_id: number | null;
   closest_object_id: number | null;
+
+  // Phase 10 Crowd & Dynamic Scene fields
+  people_count?: number;
+  crowd_size?: CrowdSize | string;
+  crowd_distribution?: CrowdDistribution | string;
+  crowd_center?: boolean;
+  crowd_left?: boolean;
+  crowd_right?: boolean;
+  crowd_both_sides?: boolean;
+  is_crowded?: boolean;
+  crowd_blocking?: boolean;
+  person_states?: (PersonState | string)[];
 }
 
 // Alias for backwards compatibility
@@ -341,6 +386,10 @@ export interface NavigationResult {
   movement_steps?: number;
   step_confidence?: DistanceConfidence | string;
   step_reason?: string;
+
+  // Phase 3 Closed-Loop Navigation verification
+  closed_loop_state?: string;
+  environment_verified?: boolean;
 }
 
 /* =========================================================
@@ -372,11 +421,273 @@ export interface SafetyResult {
 }
 
 /* =========================================================
+   OCR Text Recognition Contract
+   ========================================================= */
+
+export interface OcrItem {
+  text: string;
+  confidence: number;
+  position: ObjectPosition | string;
+  bbox?: {
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+  };
+}
+
+export interface OcrResult {
+  detected: boolean;
+  text_count: number;
+  primary_text: string;
+  items: OcrItem[];
+  is_repeat?: boolean;
+  should_speak?: boolean;
+}
+
+/* =========================================================
+   Phase 2 Indoor Safety Perception Contracts
+   ========================================================= */
+
+export type DoorState = "OPEN" | "CLOSED" | "BLOCKED" | "POSSIBLE" | "NONE";
+
+export interface DoorAnalysis {
+  detected: boolean;
+  state: DoorState;
+  confidence: number;
+  walkable: boolean;
+  bbox?: {
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+  } | null;
+  interior_depth?: number;
+  message?: string;
+}
+
+export type StairType = "STAIRS_DOWN" | "STAIRS_UP" | "DROP_OFF" | "NONE";
+export type StairHazardLevel = "CRITICAL" | "WARNING" | "SAFE";
+
+export interface StairAnalysis {
+  detected: boolean;
+  type: StairType;
+  confidence: number;
+  hazard_level: StairHazardLevel;
+  distance_m: number;
+  step_count_estimate?: number;
+  message?: string;
+}
+
+export interface FloorHazard {
+  class_name: string;
+  bbox: {
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+  };
+  hazard_type: string;
+  distance_m: number;
+  risk_score: number;
+  confidence: number;
+  position: ObjectPosition | string;
+  cand_depth?: number;
+  description?: string;
+}
+
+export interface GlassObstacle {
+  detected: boolean;
+  confidence: number;
+  position: ObjectPosition | string;
+  risk_score: number;
+  reason?: string;
+}
+
+export type CorridorClearanceState = "CLEAR" | "NARROW" | "BLOCKED";
+
+export interface CorridorAnalysis {
+  corridor_detected: boolean;
+  walkable_width_m: number;
+  clearance_state: CorridorClearanceState;
+  vanishing_point?: {
+    x: number;
+    y: number;
+  } | null;
+  left_boundary_x?: number;
+  right_boundary_x?: number;
+  message?: string;
+}
+
+/* =========================================================
+   Phase 3 Semantic Indoor Understanding & Landmark Layer
+   ========================================================= */
+
+export type SemanticLandmarkType =
+  | "EXIT"
+  | "ENTRANCE"
+  | "RESTROOM"
+  | "STAIRS"
+  | "ELEVATOR"
+  | "RECEPTION"
+  | "ROOM"
+  | "OFFICE"
+  | "CAFETERIA"
+  | "LOBBY"
+  | "WARNING"
+  | "EMERGENCY"
+  | "INFORMATION"
+  | "UNKNOWN_SIGN"
+  | string;
+
+export interface SemanticLandmark {
+  type: SemanticLandmarkType;
+  label: string;
+  text: string;
+  clean_text: string;
+  identifier?: string | null;
+  position: ObjectPosition | "CENTER" | "LEFT" | "RIGHT" | string;
+  confidence: number;
+  bbox?: BoundingBoxCoordinates | BoundingBox;
+  is_navigable_cue: boolean;
+  safety_relevance: "HIGH" | "MEDIUM" | "LOW" | string;
+  should_announce: boolean;
+}
+
+/* =========================================================
+   Phase 4 Closed-Loop Indoor Destination Navigation
+   ========================================================= */
+
+export type NavigationSessionState =
+  | "IDLE"
+  | "SEARCHING"
+  | "APPROACHING"
+  | "TURNING"
+  | "VERIFYING"
+  | "AVOIDING"
+  | "ARRIVED"
+  | "LOST"
+  | "CANCELLED";
+
+export type RelativeProximity =
+  | "FAR"
+  | "NEAR"
+  | "VERY_CLOSE"
+  | "UNKNOWN";
+
+export type TurnVerificationState =
+  | "NOT_REQUIRED"
+  | "IN_PROGRESS"
+  | "VERIFIED"
+  | "FAILED"
+  | "TIMEOUT";
+
+export interface DestinationInfo {
+  name: string;
+  type: string;
+  identifier?: string;
+  raw_query?: string;
+}
+
+export interface TurnVerificationInfo {
+  status: TurnVerificationState;
+  pending_turn: string;
+  frames_waited: number;
+  visual_change_detected?: boolean;
+  timeout_reached?: boolean;
+}
+
+export interface NavigationSessionInfo {
+  active: boolean;
+  state: NavigationSessionState;
+  destination: DestinationInfo | null;
+  destination_visible: boolean;
+  destination_position: ObjectPosition | "UNKNOWN";
+  progress: RelativeProximity;
+  turn_verification: TurnVerificationInfo;
+  arrival: boolean;
+  arrival_announced?: boolean;
+  safety_override?: boolean;
+  speech_message?: string;
+}
+
+/* =========================================================
+   Phase 5 Real-World Indoor Robustness & Perception Health
+   ========================================================= */
+
+export type PerceptionHealthStatus =
+  | "HEALTHY"
+  | "DEGRADED"
+  | "UNCERTAIN"
+  | "FAILED";
+
+export type ImageQualityStatus = "GOOD" | "DEGRADED" | "POOR" | "OBSTRUCTED";
+
+export interface ImageQualityInfo {
+  status: ImageQualityStatus | string;
+  brightness: number;
+  contrast: number;
+  blur_score: number;
+  is_low_light: boolean;
+  is_severely_dark: boolean;
+  is_overexposed: boolean;
+  is_low_contrast: boolean;
+  is_blurred: boolean;
+  is_obstructed: boolean;
+  message?: string;
+}
+
+export interface ModelHealthInfo {
+  status: PerceptionHealthStatus | string;
+  yolo_valid: boolean;
+  yolo_error?: string | null;
+  depth_valid: boolean;
+  depth_error?: string | null;
+  message?: string;
+}
+
+export interface PerceptionHealthInfo {
+  status: PerceptionHealthStatus;
+  score: number;
+  message: string;
+  safety_override?: string | null;
+  voice_override?: string | null;
+  image_quality?: ImageQualityInfo;
+  model_health?: ModelHealthInfo;
+  reflection_uncertainty?: boolean;
+  scene_flux?: boolean;
+  scene_flux_diff?: number;
+  is_crowded?: boolean;
+  person_count?: number;
+  stale_frame?: boolean;
+  stale_age_s?: number;
+}
+
+/* =========================================================
    SmartVision Backend Response
    ========================================================= */
 
 export interface SmartVisionResponse {
   success: boolean;
+
+  ocr?: OcrResult;
+
+  // Phase 2 Indoor Safety Perception Fields
+  door_analysis?: DoorAnalysis;
+  stair_analysis?: StairAnalysis;
+  floor_hazards?: FloorHazard[];
+  glass_obstacles?: GlassObstacle;
+  corridor_analysis?: CorridorAnalysis;
+
+  // Phase 3 Semantic Indoor Understanding Fields
+  semantic_landmarks?: SemanticLandmark[];
+  primary_semantic_sign?: SemanticLandmark | null;
+
+  // Phase 4 Closed-Loop Indoor Destination Navigation Fields
+  navigation_session?: NavigationSessionInfo;
+
+  // Phase 5 Real-World Indoor Robustness & Perception Health Fields
+  perception_health?: PerceptionHealthInfo;
 
   frame?: FrameInfo;
 
@@ -443,6 +754,9 @@ export interface SmartVisionResponse {
   camera_occluded?: boolean;
   camera_obstructed?: boolean;
   sensor_degraded?: boolean;
+  nav_state?: string;
+  state_changed?: boolean;
+  should_speak?: boolean;
 }
 
 /* =========================================================

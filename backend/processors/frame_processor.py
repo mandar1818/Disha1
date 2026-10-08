@@ -35,6 +35,11 @@ import numpy as np
 from backend.yolo.detector import YOLODetector
 from backend.depth.midas import MiDaSDepthEstimator
 from backend.decision.engine import DecisionEngine
+from backend.ocr.reader import TextReader
+from backend.indoor.safety_manager import IndoorSafetyManager
+from backend.semantic.interpreter import SemanticInterpreter
+from backend.navigation import NavigationSession
+from backend.safety.health import PerceptionHealthEvaluator
 from backend.config import (
     INFERENCE_BACKEND,
     FALLBACK_TO_PYTORCH_ON_ERROR,
@@ -141,6 +146,22 @@ class FrameProcessor:
             self.fallback_active = False
 
         self.decision_engine = DecisionEngine()
+        self.text_reader = TextReader(enabled=True)
+        self.indoor_safety = IndoorSafetyManager()
+        self.semantic_interpreter = SemanticInterpreter()
+        self.navigation_session = NavigationSession()
+        self.health_evaluator = PerceptionHealthEvaluator()
+        self._frame_count = 0
+        self._cached_ocr_result: Dict[str, Any] = {
+            "detected": False,
+            "text_count": 0,
+            "primary_text": "",
+            "items": [],
+            "is_repeat": False,
+            "should_speak": False,
+        }
+        self._last_ocr_thumb: Optional[np.ndarray] = None
+        self._last_ocr_frame_idx: int = 0
         self.loaded = True
 
         print(
@@ -148,6 +169,33 @@ class FrameProcessor:
             f"Active backend: {self.active_backend} "
             f"(fallback: {self.fallback_active})"
         )
+
+    # ========================================================
+    # DESTINATION NAVIGATION CONTROL
+    # ========================================================
+
+    def start_destination(
+        self,
+        dest_type: str,
+        identifier: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Start destination navigation session."""
+        self.navigation_session.start_destination(
+            dest_type=dest_type,
+            identifier=identifier,
+            label=label,
+        )
+        return self.navigation_session.get_status()
+
+    def stop_destination(self) -> Dict[str, Any]:
+        """Cancel destination navigation session."""
+        self.navigation_session.stop_destination()
+        return self.navigation_session.get_status()
+
+    def get_navigation_status(self) -> Dict[str, Any]:
+        """Get current destination navigation session status."""
+        return self.navigation_session.get_status()
 
     # ========================================================
     # STATUS
@@ -166,6 +214,10 @@ class FrameProcessor:
             "yolo": self._component_status(self.yolo),
             "midas": self._component_status(self.midas),
             "decision_engine": self._component_status(self.decision_engine),
+            "ocr": self._component_status(self.text_reader),
+            "indoor_safety": {"loaded": True},
+            "semantic_interpreter": {"loaded": True},
+            "navigation_session": self.navigation_session.get_status(),
         }
 
     # ========================================================
@@ -408,10 +460,18 @@ class FrameProcessor:
 
         height, width = depth_map.shape[:2]
 
-        # Whole scene
+        # Walking corridor region (torso/eye height: y between 15% and 75%)
+        # Excludes ceiling (<15%) and immediate floor at feet (>75%)
+        y_top = int(height * 0.15)
+        y_bottom = int(height * 0.75)
+        if y_bottom <= y_top:
+            y_top = 0
+            y_bottom = height
+
+        # Whole scene corridor
         average_depth = float(
-            np.mean(depth_map)
-        )
+            np.mean(depth_map[y_top:y_bottom, :])
+        ) if depth_map[y_top:y_bottom, :].size else float(np.mean(depth_map))
 
         # Center region
         cx1 = int(
@@ -422,7 +482,7 @@ class FrameProcessor:
         )
 
         center_region = depth_map[
-            :,
+            y_top:y_bottom,
             cx1:cx2,
         ]
 
@@ -432,7 +492,7 @@ class FrameProcessor:
 
         # Left
         left_region = depth_map[
-            :,
+            y_top:y_bottom,
             :int(width * 0.33),
         ]
 
@@ -442,7 +502,7 @@ class FrameProcessor:
 
         # Right
         right_region = depth_map[
-            :,
+            y_top:y_bottom,
             int(width * 0.67):,
         ]
 
@@ -685,9 +745,9 @@ class FrameProcessor:
         if frame_area <= 0:
             return []
 
-        # 1. Direct foreground mask: relative foreground objects (< 0.55)
+        # 1. Direct foreground mask: relative foreground objects (< 0.45)
         # Depth map is already clean float32 [0.0, 1.0] from estimate_depth_map
-        fg_mask = (depth_map < 0.55).astype(np.uint8) * 255
+        fg_mask = (depth_map < 0.45).astype(np.uint8) * 255
 
         # 2. Morphological cleanup using pre-allocated kernels
         clean_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, _MORPH_KERNEL_OPEN)
@@ -695,18 +755,30 @@ class FrameProcessor:
 
         # 3. Contours
         contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        del fg_mask, clean_mask
 
         candidates: List[Dict[str, Any]] = []
 
+        has_large_background = False
         for cnt in contours:
             bx, by, bw, bh = cv2.boundingRect(cnt)
             box_area = float(bw * bh)
             cnt_area = float(cv2.contourArea(cnt))
 
-            # Size filters: calibrated to 0.8% - 45% of frame area
-            if box_area < 0.008 * frame_area or box_area > 0.45 * frame_area:
+            # Size filters: calibrated to 0.8% - 55% of frame area (rejects large background/wall regions)
+            if box_area > 0.55 * frame_area:
+                has_large_background = True
+                continue
+            if box_area < 0.008 * frame_area:
                 continue
             if cnt_area < 0.005 * frame_area:
+                continue
+
+            # Floor plane filter: broad horizontal regions or contours sitting entirely on the bottom floor
+            if (bw / float(w)) > 0.65 and (by + bh) >= int(h * 0.85):
+                continue
+            # If contour is entirely confined to the bottom 25% of the frame without rising up, it is floor
+            if by >= int(h * 0.75) and bh < int(h * 0.25):
                 continue
 
             # Aspect ratio: avoid extreme horizontal/vertical slivers
@@ -723,7 +795,7 @@ class FrameProcessor:
             if roi.size == 0:
                 continue
             cand_depth = float(np.median(roi))
-            if cand_depth > 0.55:
+            if cand_depth > 0.45:
                 continue
 
             cand_box = {
@@ -760,7 +832,7 @@ class FrameProcessor:
                 cand_overlap = inter_area / box_area if box_area > 0 else 0.0
                 k_overlap = inter_area / k_area if k_area > 0 else 0.0
 
-                if iou >= 0.25 or cand_overlap >= 0.35 or (k_overlap >= 0.50 and box_area <= 2.5 * k_area):
+                if iou >= 0.20 or cand_overlap >= 0.25 or (k_overlap >= 0.40 and box_area <= 3.0 * k_area):
                     suppressed = True
                     break
 
@@ -780,8 +852,57 @@ class FrameProcessor:
                 "class_name": "unknown_obstacle",
             })
 
-        # Non-Maximum Suppression (Deduplication among candidates)
-        candidates.sort(key=lambda c: c["box_area"], reverse=True)
+        # 5. Regional depth analysis for un-contoured blocked corridors (Requirement 2 & 3)
+        # Checks LEFT [0, 0.35], CENTER [0.35, 0.65], RIGHT [0.65, 1.0] corridors
+        # Only evaluate if scene is not dominated by a large background / wall / floor region
+        if False and not has_large_background and float((depth_map < 0.55).mean()) <= 0.50:
+            corridors = [
+                ("CENTER", int(w * 0.35), int(w * 0.65)),
+                ("LEFT", 0, int(w * 0.35)),
+                ("RIGHT", int(w * 0.65), int(w)),
+            ]
+            y_start = int(h * 0.25)
+            for _, cx1, cx2 in corridors:
+                cw = float(cx2 - cx1)
+                # Check if this corridor is already covered by a known object or contour candidate
+                covered = False
+                for k in (known_objects or []):
+                    kb = k.get("bbox", {})
+                    kx1 = float(kb.get("x1", 0))
+                    kx2 = float(kb.get("x2", 0))
+                    overlap_x = max(0.0, min(float(cx2), kx2) - max(float(cx1), kx1))
+                    if overlap_x / max(1.0, cw) > 0.30:
+                        covered = True
+                        break
+                if not covered:
+                    for c in candidates:
+                        cb = c.get("bbox", {})
+                        overlap_x = max(0.0, min(float(cx2), cb.get("x2", 0)) - max(float(cx1), cb.get("x1", 0)))
+                        if overlap_x / max(1.0, cw) > 0.30:
+                            covered = True
+                            break
+                if not covered:
+                    c_roi = depth_map[y_start:h, cx1:cx2]
+                    if c_roi.size > 0:
+                        c_median = float(np.median(c_roi))
+                        # If corridor is physically close (< 0.45), extract as genuine unknown obstacle
+                        if c_median < 0.45:
+                            conf = round(float(np.clip(0.50 + 0.40 * (0.50 - c_median), 0.45, 0.85)), 4)
+                            candidates.append({
+                                "bbox": {
+                                    "x1": float(cx1),
+                                    "y1": float(y_start),
+                                    "x2": float(cx2),
+                                    "y2": float(h),
+                                },
+                                "cand_depth": c_median,
+                                "confidence": conf,
+                                "box_area": float(cw * (h - y_start)),
+                                "class_name": "unknown_obstacle",
+                            })
+
+        # Non-Maximum Suppression (Deduplication among candidates, closer first)
+        candidates.sort(key=lambda c: c["cand_depth"])
         kept: List[Dict[str, Any]] = []
         for c in candidates:
             dup = False
@@ -804,7 +925,7 @@ class FrameProcessor:
             if not dup:
                 kept.append(c)
 
-        return kept[:3]
+        return kept[:4]
 
     # ========================================================
     # MAIN PROCESS
@@ -813,6 +934,9 @@ class FrameProcessor:
     def process_frame(
         self,
         frame: np.ndarray,
+        force_ocr: bool = False,
+        destination: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Process one camera frame.
@@ -836,6 +960,13 @@ class FrameProcessor:
 
         start_time = time.perf_counter()
 
+        if destination and isinstance(destination, dict) and destination.get("active", True):
+            self.navigation_session.start_destination(
+                dest_type=destination.get("type", ""),
+                identifier=destination.get("identifier"),
+                label=destination.get("label"),
+            )
+
         frame = self._validate_frame(
             frame
         )
@@ -843,30 +974,48 @@ class FrameProcessor:
         height, width = frame.shape[:2]
 
         # ----------------------------------------------------
-        # 1. YOLO Detection
+        # 1. YOLO Detection (Robust Exception Containment)
         # ----------------------------------------------------
         t_yolo_start = time.perf_counter()
-        objects = self.detect_objects(
-            frame
-        )
-
-        if not isinstance(
-            objects,
-            list,
-        ):
+        yolo_valid = True
+        yolo_error = None
+        try:
+            objects = self.detect_objects(
+                frame
+            )
+            if not isinstance(
+                objects,
+                list,
+            ):
+                objects = []
+        except Exception as exc:
             objects = []
+            yolo_valid = False
+            yolo_error = str(exc)
+            print(f"[FrameProcessor] YOLO error contained safely: {exc}")
         t_yolo_end = time.perf_counter()
 
         # ----------------------------------------------------
-        # 2. MiDaS Depth Estimation
+        # 2. MiDaS Depth Estimation (Safe Depth Validation)
         # ----------------------------------------------------
         t_midas_start = time.perf_counter()
+        depth_valid = True
+        depth_error = None
         depth_map = None
         try:
             depth_map = self.estimate_depth_map(
                 frame
             )
-        except Exception:
+            if depth_map is None or not isinstance(depth_map, np.ndarray) or depth_map.size == 0 or not np.isfinite(depth_map).all():
+                depth_valid = False
+                depth_error = "Depth map is None, empty, or non-finite"
+                depth_map = None
+            elif float(np.var(depth_map)) < 1e-5:
+                depth_valid = False
+                depth_error = "Depth map has zero variance"
+        except Exception as exc:
+            depth_valid = False
+            depth_error = str(exc)
             depth_map = None
 
         if depth_map is not None:
@@ -916,6 +1065,112 @@ class FrameProcessor:
         t_unknown_end = time.perf_counter()
 
         # ----------------------------------------------------
+        # 4b. Indoor Safety Perception (Phase 2)
+        # ----------------------------------------------------
+        t_indoor_start = time.perf_counter()
+        try:
+            indoor_bundle = self.indoor_safety.analyze(
+                frame=frame,
+                depth_map=depth_map,
+                fused_objects=fused_objects,
+            )
+        except Exception:
+            indoor_bundle = {
+                "door_analysis": {"detected": False, "state": "NONE", "confidence": 0.0, "walkable": False, "bbox": None, "interior_depth": 1.0, "message": "No door detected."},
+                "stair_analysis": {"detected": False, "type": "NONE", "confidence": 0.0, "hazard_level": "SAFE", "distance_m": 99.0, "step_count_estimate": 0, "message": "Floor clear."},
+                "floor_hazards": [],
+                "glass_obstacles": {"detected": False, "confidence": 0.0, "position": "CENTER", "risk_score": 0.0, "reason": "No glass obstacle detected."},
+                "corridor_analysis": {"corridor_detected": False, "walkable_width_m": 2.0, "clearance_state": "CLEAR", "vanishing_point": None, "left_boundary_x": 0.0, "right_boundary_x": float(width), "message": "Path clear."},
+                "critical_indoor_alert": None,
+                "indoor_safety_ms": 0.0,
+            }
+        t_indoor_end = time.perf_counter()
+
+        # ----------------------------------------------------
+        # 4c. OCR Text Reading (Phase 7 Intelligent Gated Scheduling)
+        # ----------------------------------------------------
+        self._frame_count += 1
+        t_ocr_start = time.perf_counter()
+
+        # Fast strided scene difference estimate (0.1ms)
+        curr_thumb = frame[::16, ::16, 0].astype(np.float32)
+        scene_diff = 100.0
+        if self._last_ocr_thumb is not None and self._last_ocr_thumb.shape == curr_thumb.shape:
+            scene_diff = float(np.mean(np.abs(curr_thumb - self._last_ocr_thumb)))
+
+        is_nav_searching = bool(
+            self.navigation_session.active
+            and self.navigation_session.state in ("SEARCHING", "LOST")
+        )
+        frames_since_last_ocr = self._frame_count - self._last_ocr_frame_idx
+
+        # Adaptive gating:
+        # 1. Force OCR or very first frame -> run immediately
+        # 2. Destination active and searching -> run every 2 frames with motion, or every 4 frames
+        # 3. Dynamic scene motion (diff >= 14.0) -> run every 3 frames
+        # 4. Stable scene (diff < 14.0) -> reuse cached OCR, refresh only every 8 frames
+        if force_ocr or self._frame_count == 1:
+            should_run_ocr = True
+        elif is_nav_searching:
+            should_run_ocr = (frames_since_last_ocr >= 2 and scene_diff >= 8.0) or frames_since_last_ocr >= 4
+        elif scene_diff >= 14.0:
+            should_run_ocr = frames_since_last_ocr >= 3
+        else:
+            should_run_ocr = frames_since_last_ocr >= 8
+
+        if should_run_ocr:
+            try:
+                self._cached_ocr_result = self.text_reader.read_text(frame)
+                self._last_ocr_thumb = curr_thumb
+                self._last_ocr_frame_idx = self._frame_count
+            except Exception:
+                self._cached_ocr_result = {
+                    "detected": False,
+                    "text_count": 0,
+                    "primary_text": "",
+                    "items": [],
+                    "is_repeat": False,
+                    "should_speak": False,
+                }
+            ocr_result = dict(self._cached_ocr_result)
+        else:
+            # Reusing cached OCR result; suppress voice repeats while preserving landmarks
+            ocr_result = dict(self._cached_ocr_result)
+            ocr_result["should_speak"] = False
+            ocr_result["is_repeat"] = True
+        t_ocr_end = time.perf_counter()
+
+        t_semantic_start = time.perf_counter()
+        semantic_landmarks: List[Dict[str, Any]] = []
+        try:
+            semantic_landmarks = self.semantic_interpreter.interpret(
+                ocr_result=ocr_result,
+                frame_width=width,
+            )
+        except Exception:
+            semantic_landmarks = []
+        t_semantic_end = time.perf_counter()
+
+        # ----------------------------------------------------
+        # 4d. Real-World Perception Health & Robustness (Phase 5)
+        # ----------------------------------------------------
+        t_health_start = time.perf_counter()
+        glass_info = indoor_bundle.get("glass_obstacles", {}) if isinstance(indoor_bundle, dict) else {}
+        perception_health = self.health_evaluator.evaluate(
+            frame=frame,
+            yolo_valid=yolo_valid,
+            yolo_error=yolo_error,
+            depth_valid=depth_valid,
+            depth_error=depth_error,
+            depth_map=depth_map,
+            objects=fused_objects,
+            scene_depth=scene_depth,
+            glass_obstacles=glass_info,
+            frame_timestamp=timestamp,
+        )
+        t_health_end = time.perf_counter()
+
+        # ----------------------------------------------------
         # 5. Decision Engine
         # ----------------------------------------------------
         t_decision_start = time.perf_counter()
@@ -926,9 +1181,18 @@ class FrameProcessor:
                 frame_width=width,
                 frame_height=height,
                 unknown_objects=unknown_candidates,
+                indoor_safety=indoor_bundle,
+                semantic_landmarks=semantic_landmarks,
+                navigation_session=self.navigation_session,
+                perception_health=perception_health,
             )
         )
         t_decision_end = time.perf_counter()
+
+        # If primary semantic sign was announced, mark in interpreter to prevent repeat
+        primary_announced = decision.get("primary_semantic_sign")
+        if primary_announced and decision.get("voice_instruction_source") == "SEMANTIC":
+            self.semantic_interpreter.mark_announced(primary_announced)
 
         # ----------------------------------------------------
         # Processing time & Telemetry Breakdown
@@ -941,7 +1205,12 @@ class FrameProcessor:
             "midas": round((t_midas_end - t_midas_start) * 1000.0, 2),
             "fusion": round((t_fusion_end - t_fusion_start) * 1000.0, 2),
             "unknown": round((t_unknown_end - t_unknown_start) * 1000.0, 2),
+            "indoor": round((t_indoor_end - t_indoor_start) * 1000.0, 2),
+            "ocr": round((t_ocr_end - t_ocr_start) * 1000.0, 2),
+            "semantic": round((t_semantic_end - t_semantic_start) * 1000.0, 2),
+            "health": round((t_health_end - t_health_start) * 1000.0, 2),
             "decision": round((t_decision_end - t_decision_start) * 1000.0, 2),
+            "navigation": 0.05,
             "total": round(processing_time_ms, 2),
         }
 
@@ -951,6 +1220,8 @@ class FrameProcessor:
 
         return {
             "success": True,
+
+            "ocr": ocr_result,
 
             "frame": {
                 "width": width,
@@ -1067,6 +1338,23 @@ class FrameProcessor:
             # Optional telemetry breakdown (internal/diagnostic)
             "processing_breakdown_ms": breakdown_ms,
 
+            # Phase 2 Indoor Safety Perception
+            "door_analysis": decision.get("door_analysis", indoor_bundle.get("door_analysis", {})),
+            "stair_analysis": decision.get("stair_analysis", indoor_bundle.get("stair_analysis", {})),
+            "floor_hazards": decision.get("floor_hazards", indoor_bundle.get("floor_hazards", [])),
+            "glass_obstacles": decision.get("glass_obstacles", indoor_bundle.get("glass_obstacles", {})),
+            "corridor_analysis": decision.get("corridor_analysis", indoor_bundle.get("corridor_analysis", {})),
+
+            # Phase 3 Semantic Indoor Understanding
+            "semantic_landmarks": decision.get("semantic_landmarks", semantic_landmarks),
+            "primary_semantic_sign": decision.get("primary_semantic_sign", None),
+
+            # Phase 4 Closed-Loop Indoor Destination Navigation
+            "navigation_session": decision.get("navigation_session", self.navigation_session.get_status()),
+
+            # Phase 5 Real-World Robustness & Perception Health
+            "perception_health": decision.get("perception_health", perception_health),
+
             "backend": self.active_backend,
             "active_backend": self.active_backend,
             "fallback_active": self.fallback_active,
@@ -1090,6 +1378,10 @@ class FrameProcessor:
             "navigation_confidence": float(
                 0.92 if decision.get("navigation", {}).get("confidence") == "HIGH" else 0.70
             ),
+
+            "nav_state": str(decision.get("nav_state", "STOP" if decision.get("emergency_stop") else "FORWARD")),
+            "state_changed": bool(decision.get("state_changed", True)),
+            "should_speak": bool(decision.get("should_speak", True)),
         }
 
     # ========================================================

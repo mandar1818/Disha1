@@ -140,6 +140,14 @@ function normalizeBoundingBox(
   return null;
 }
 
+export function getSafetyBadge(riskScore: number): { label: string; color: string; bgAlpha: string } {
+  if (riskScore >= 0.8) return { label: "EMERGENCY", color: COLORS.emergency, bgAlpha: "rgba(185, 28, 28, 0.20)" };
+  if (riskScore >= 0.6) return { label: "DANGER", color: COLORS.danger, bgAlpha: "rgba(239, 68, 68, 0.18)" };
+  if (riskScore >= 0.4) return { label: "CAUTION", color: COLORS.caution, bgAlpha: "rgba(245, 158, 11, 0.16)" };
+  if (riskScore >= 0.2) return { label: "AWARE", color: COLORS.aware, bgAlpha: "rgba(234, 179, 8, 0.14)" };
+  return { label: "SAFE", color: COLORS.safe, bgAlpha: "rgba(34, 197, 94, 0.12)" };
+}
+
 /**
  * Convert backend detection into a safe normalized object.
  */
@@ -158,11 +166,17 @@ function normalizeDetection(
     return null;
   }
 
-  const label =
+  let label =
     detection.class_name ??
     detection.name ??
     detection.label ??
-    "Unknown";
+    "Unknown Obstacle";
+
+  if (label.toLowerCase().includes("unknown")) {
+    label = "Unknown Obstacle";
+  } else {
+    label = label.replace(/_/g, " ").replace(/\b\w/g, (l) => l.toUpperCase());
+  }
 
   const rawPosition = String(detection.position ?? "CENTER").toUpperCase();
 
@@ -174,7 +188,9 @@ function normalizeDetection(
         : "CENTER";
 
   const depthValue =
-    typeof detection.depth === "number"
+    typeof detection.distance_m === "number" && Number.isFinite(detection.distance_m)
+      ? detection.distance_m
+      : typeof detection.depth === "number"
       ? detection.depth
       : typeof detection.estimated_distance === "number"
         ? detection.estimated_distance
@@ -184,6 +200,17 @@ function normalizeDetection(
     typeof detection.risk_score === "number"
       ? detection.risk_score
       : 0;
+
+  const distanceText =
+    typeof detection.distance_m === "number" && Number.isFinite(detection.distance_m) && detection.distance_m > 0
+      ? `${detection.distance_m.toFixed(1)}m`
+      : typeof detection.estimated_distance_m === "number" && Number.isFinite(detection.estimated_distance_m) && detection.estimated_distance_m > 0
+      ? `${detection.estimated_distance_m.toFixed(1)}m`
+      : detection.distance_category && detection.distance_category !== "UNKNOWN_DISTANCE"
+      ? detection.distance_category.replace("_", " ")
+      : "";
+
+  const safety = getSafetyBadge(riskScore);
 
   return {
     ...detection,
@@ -195,6 +222,8 @@ function normalizeDetection(
     y2: box.y2,
     depthValue: Number.isFinite(depthValue) ? depthValue : 0,
     riskScore,
+    distanceText,
+    safetyLabel: safety.label,
   };
 }
 
@@ -311,6 +340,9 @@ export default function DetectionOverlay({
     <View
       pointerEvents="none"
       style={StyleSheet.absoluteFill}
+      accessible={false}
+      accessibilityElementsHidden={true}
+      importantForAccessibility="no-hide-descendants"
     >
       {normalized.map((detection, index) => {
         const boxStyle = getBoxStyle(
@@ -319,27 +351,22 @@ export default function DetectionOverlay({
           frameHeight
         );
 
-        const riskColor = getRiskColor(detection);
-
-        const confidence = formatConfidence(
-          detection.confidence
-        );
-
-        const depth = formatDepth(
-          detection.depthValue
-        );
+        const safety = getSafetyBadge(detection.riskScore);
+        const riskColor = safety.color;
 
         return (
           <View
-            key={`${detection.label}-${index}`}
+            key={`${detection.label}-${index}-${detection.x1}`}
             style={[
               styles.box,
               boxStyle,
               {
                 borderColor: riskColor,
+                backgroundColor: safety.bgAlpha,
               },
             ]}
           >
+            {/* Header Badge: Object Name + Metric Distance + Safety Level */}
             <View
               style={[
                 styles.labelContainer,
@@ -352,30 +379,34 @@ export default function DetectionOverlay({
                 {detection.label}
               </Text>
 
-              <Text style={styles.confidence}>
-                {confidence}
-              </Text>
-
-              {depth ? (
-                <Text style={styles.depth}>
-                  {depth}
-                </Text>
+              {detection.distanceText ? (
+                <View style={styles.distanceBadge}>
+                  <Text style={styles.distanceText}>
+                    {detection.distanceText}
+                  </Text>
+                </View>
               ) : null}
+
+              <View style={styles.safetyBadge}>
+                <Text style={styles.safetyTag}>
+                  {detection.safetyLabel || safety.label}
+                </Text>
+              </View>
             </View>
 
-            {detection.position ? (
+            {detection.positionLabel ? (
               <View
                 style={[
                   styles.positionBadge,
                   {
-                    backgroundColor: riskColor,
+                    backgroundColor: "rgba(0,0,0,0.85)",
+                    borderColor: riskColor,
+                    borderWidth: 1.5,
                   },
                 ]}
               >
                 <Text style={styles.positionText}>
-                  {String(
-                    detection.position
-                  ).toUpperCase()}
+                  {detection.positionLabel}
                 </Text>
               </View>
             ) : null}
@@ -389,19 +420,19 @@ export default function DetectionOverlay({
 const styles = StyleSheet.create({
   box: {
     position: "absolute",
-    borderWidth: 2,
-    borderRadius: 4,
+    borderWidth: 2.5,
+    borderRadius: 6,
     overflow: "visible",
   },
 
   labelContainer: {
     position: "absolute",
-    top: -28,
+    top: -30,
     left: -2,
-    minHeight: 25,
+    minHeight: 26,
     paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 5,
+    paddingVertical: 3,
+    borderRadius: 6,
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
@@ -413,30 +444,46 @@ const styles = StyleSheet.create({
     fontWeight: "900",
   },
 
-  confidence: {
-    color: COLORS.white,
-    fontSize: 11,
-    fontWeight: "700",
+  distanceBadge: {
+    backgroundColor: "rgba(0, 0, 0, 0.45)",
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    borderRadius: 4,
   },
 
-  depth: {
+  distanceText: {
+    color: COLORS.white,
+    fontSize: 11,
+    fontWeight: "900",
+  },
+
+  safetyBadge: {
+    backgroundColor: "rgba(255, 255, 255, 0.25)",
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+
+  safetyTag: {
     color: COLORS.white,
     fontSize: 10,
-    fontWeight: "700",
+    fontWeight: "900",
+    letterSpacing: 0.5,
   },
 
   positionBadge: {
     position: "absolute",
     right: 3,
     bottom: 3,
-    paddingHorizontal: 5,
+    paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 4,
   },
 
   positionText: {
     color: COLORS.white,
-    fontSize: 8,
+    fontSize: 9,
     fontWeight: "900",
+    letterSpacing: 0.5,
   },
 });
